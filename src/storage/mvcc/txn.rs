@@ -44,6 +44,7 @@ impl<'a> MvccTxn<'a> {
         start_ts: u64,
         mode: Option<ScanMode>,
         isolation_level: IsolationLevel,
+        fill_cache: bool,
     ) -> MvccTxn<'a> {
         MvccTxn {
             // Todo: use session variable to indicate fill cache or not
@@ -51,7 +52,7 @@ impl<'a> MvccTxn<'a> {
                 snapshot,
                 statistics,
                 mode,
-                true, // fill_cache
+                fill_cache,
                 None,
                 isolation_level,
             ),
@@ -123,9 +124,12 @@ impl<'a> MvccTxn<'a> {
     ) -> Result<()> {
         let key = mutation.key();
         if !options.skip_constraint_check {
-            if let Some((commit, _)) = try!(self.reader.seek_write(key, u64::max_value())) {
+            if let Some((commit, _)) = self.reader.seek_write(key, u64::max_value())? {
                 // Abort on writes after our start timestamp ...
                 if commit >= self.start_ts {
+                    MVCC_CONFLICT_COUNTER
+                        .with_label_values(&["prewrite_write_conflict"])
+                        .inc();
                     return Err(Error::WriteConflict {
                         start_ts: self.start_ts,
                         conflict_ts: commit,
@@ -136,10 +140,10 @@ impl<'a> MvccTxn<'a> {
             }
         }
         // ... or locks at any timestamp.
-        if let Some(lock) = try!(self.reader.load_lock(key)) {
+        if let Some(lock) = self.reader.load_lock(key)? {
             if lock.ts != self.start_ts {
                 return Err(Error::KeyIsLocked {
-                    key: try!(key.raw()),
+                    key: key.raw()?,
                     primary: lock.primary,
                     ts: lock.ts,
                     ttl: lock.ttl,
@@ -182,13 +186,16 @@ impl<'a> MvccTxn<'a> {
     }
 
     pub fn commit(&mut self, key: &Key, commit_ts: u64) -> Result<()> {
-        let (lock_type, short_value) = match try!(self.reader.load_lock(key)) {
+        let (lock_type, short_value) = match self.reader.load_lock(key)? {
             Some(ref mut lock) if lock.ts == self.start_ts => {
                 (lock.lock_type, lock.short_value.take())
             }
             _ => {
-                return match try!(self.reader.get_txn_commit_info(key, self.start_ts)) {
+                return match self.reader.get_txn_commit_info(key, self.start_ts)? {
                     Some((_, WriteType::Rollback)) | None => {
+                        MVCC_CONFLICT_COUNTER
+                            .with_label_values(&["commit_lock_not_found"])
+                            .inc();
                         // TODO:None should not appear
                         // Rollbacked by concurrent transaction.
                         info!(
@@ -221,7 +228,7 @@ impl<'a> MvccTxn<'a> {
     }
 
     pub fn rollback(&mut self, key: &Key) -> Result<()> {
-        match try!(self.reader.load_lock(key)) {
+        match self.reader.load_lock(key)? {
             Some(ref lock) if lock.ts == self.start_ts => {
                 // If prewrite type is DEL or LOCK, it is no need to delete value.
                 if lock.short_value.is_none() && lock.lock_type == LockType::Put {
@@ -229,12 +236,15 @@ impl<'a> MvccTxn<'a> {
                 }
             }
             _ => {
-                return match try!(self.reader.get_txn_commit_info(key, self.start_ts)) {
+                return match self.reader.get_txn_commit_info(key, self.start_ts)? {
                     Some((ts, write_type)) => {
                         if write_type == WriteType::Rollback {
                             // return Ok on Rollback already exist
                             Ok(())
                         } else {
+                            MVCC_CONFLICT_COUNTER
+                                .with_label_values(&["rollback_committed"])
+                                .inc();
                             info!(
                                 "txn conflict (committed), key:{}, start_ts:{}, commit_ts:{}",
                                 key,
@@ -267,7 +277,7 @@ impl<'a> MvccTxn<'a> {
         let mut versions = 0;
         let mut delete_versions = 0;
         let mut latest_delete = None;
-        while let Some((commit, write)) = try!(self.reader.seek_write(key, ts)) {
+        while let Some((commit, write)) = self.reader.seek_write(key, ts)? {
             ts = commit - 1;
             versions += 1;
 
@@ -742,6 +752,7 @@ mod tests {
             10,
             None,
             IsolationLevel::SI,
+            true,
         );
         let key = make_key(k);
         assert_eq!(txn.write_size, 0);
@@ -765,6 +776,7 @@ mod tests {
             10,
             None,
             IsolationLevel::SI,
+            true,
         );
         txn.commit(&key, 15).unwrap();
         assert!(txn.write_size() > 0);
@@ -796,6 +808,7 @@ mod tests {
             5,
             None,
             IsolationLevel::SI,
+            true,
         );
         assert!(
             txn.prewrite(
@@ -814,6 +827,7 @@ mod tests {
             5,
             None,
             IsolationLevel::SI,
+            true,
         );
         let mut opt = Options::default();
         opt.skip_constraint_check = true;
@@ -846,6 +860,7 @@ mod tests {
             ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         assert_eq!(txn.get(&make_key(key)).unwrap().unwrap(), expect);
     }
@@ -860,6 +875,7 @@ mod tests {
             ts,
             None,
             IsolationLevel::RC,
+            true,
         );
         assert_eq!(txn.get(&make_key(key)).unwrap().unwrap(), expect)
     }
@@ -874,6 +890,7 @@ mod tests {
             ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         assert!(txn.get(&make_key(key)).unwrap().is_none());
     }
@@ -888,6 +905,7 @@ mod tests {
             ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         assert!(txn.get(&make_key(key)).is_err());
     }
@@ -902,6 +920,7 @@ mod tests {
             ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         txn.prewrite(
             Mutation::Put((make_key(key), value.to_vec())),
@@ -921,6 +940,7 @@ mod tests {
             ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         txn.prewrite(Mutation::Delete(make_key(key)), pk, &Options::default())
             .unwrap();
@@ -937,6 +957,7 @@ mod tests {
             ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         txn.prewrite(Mutation::Lock(make_key(key)), pk, &Options::default())
             .unwrap();
@@ -953,6 +974,7 @@ mod tests {
             ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         assert!(
             txn.prewrite(Mutation::Lock(make_key(key)), pk, &Options::default())
@@ -970,6 +992,7 @@ mod tests {
             start_ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         txn.commit(&make_key(key), commit_ts).unwrap();
         engine.write(&ctx, txn.modifies()).unwrap();
@@ -985,6 +1008,7 @@ mod tests {
             start_ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         assert!(txn.commit(&make_key(key), commit_ts).is_err());
     }
@@ -999,6 +1023,7 @@ mod tests {
             start_ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         txn.rollback(&make_key(key)).unwrap();
         engine.write(&ctx, txn.modifies()).unwrap();
@@ -1014,6 +1039,7 @@ mod tests {
             start_ts,
             None,
             IsolationLevel::SI,
+            true,
         );
         assert!(txn.rollback(&make_key(key)).is_err());
     }
@@ -1028,6 +1054,7 @@ mod tests {
             0,
             None,
             IsolationLevel::SI,
+            true,
         );
         txn.gc(&make_key(key), safe_point).unwrap();
         engine.write(&ctx, txn.modifies()).unwrap();

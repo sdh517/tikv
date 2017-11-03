@@ -22,11 +22,14 @@ pub use self::metrics_flusher::MetricsFlusher;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::str::FromStr;
 
 use storage::{ALL_CFS, CF_DEFAULT, CF_LOCK};
-use rocksdb::{ColumnFamilyOptions, DBCompressionType, DBOptions, ReadOptions, SliceTransform, DB};
+use rocksdb::{ColumnFamilyOptions, CompactOptions, DBCompressionType, DBOptions, ReadOptions,
+              SliceTransform, Writable, WriteBatch, DB};
 use rocksdb::rocksdb::supported_compression;
-use util::rocksdb::engine_metrics::{ROCKSDB_CUR_SIZE_ALL_MEM_TABLES, ROCKSDB_TOTAL_SST_FILES_SIZE};
+use util::rocksdb::engine_metrics::{ROCKSDB_COMPRESSION_RATIO_AT_LEVEL,
+                                    ROCKSDB_CUR_SIZE_ALL_MEM_TABLES, ROCKSDB_TOTAL_SST_FILES_SIZE};
 use util::rocksdb;
 
 pub use rocksdb::CFHandle;
@@ -69,7 +72,8 @@ pub fn open_opt(
     cfs: Vec<&str>,
     cfs_opts: Vec<ColumnFamilyOptions>,
 ) -> Result<DB, String> {
-    DB::open_cf(opts, path, cfs, cfs_opts)
+    let cfds = cfs.into_iter().zip(cfs_opts).collect();
+    DB::open_cf(opts, path, cfds)
 }
 
 pub struct CFOptions<'a> {
@@ -111,12 +115,13 @@ fn check_and_open(
             cfs_v.push(x.cf);
             cf_opts_v.push(x.options.clone());
         }
-        let mut db = try!(DB::open_cf(db_opt, path, cfs_v, cf_opts_v));
+        let cfds = cfs_v.into_iter().zip(cf_opts_v).collect();
+        let mut db = DB::open_cf(db_opt, path, cfds)?;
         for x in cfs_opts {
             if x.cf == CF_DEFAULT {
                 continue;
             }
-            try!(db.create_cf(x.cf, x.options));
+            db.create_cf((x.cf, x.options))?;
         }
 
         return Ok(db);
@@ -125,7 +130,7 @@ fn check_and_open(
     db_opt.create_if_missing(false);
 
     // List all column families in current db.
-    let cfs_list = try!(DB::list_column_families(&db_opt, path));
+    let cfs_list = DB::list_column_families(&db_opt, path)?;
     let existed: Vec<&str> = cfs_list.iter().map(|v| v.as_str()).collect();
     let needed: Vec<&str> = cfs_opts.iter().map(|x| x.cf).collect();
 
@@ -138,7 +143,8 @@ fn check_and_open(
             cfs_opts_v.push(x.options);
         }
 
-        return DB::open_cf(db_opt, path, cfs_v, cfs_opts_v);
+        let cfds = cfs_v.into_iter().zip(cfs_opts_v).collect();
+        return DB::open_cf(db_opt, path, cfds);
     }
 
     // Open db.
@@ -155,32 +161,30 @@ fn check_and_open(
             }
         }
     }
-    let mut db = DB::open_cf(db_opt, path, cfs_v, cfs_opts_v).unwrap();
+    let cfds = cfs_v.into_iter().zip(cfs_opts_v).collect();
+    let mut db = DB::open_cf(db_opt, path, cfds).unwrap();
 
     // Drop discarded column families.
     //    for cf in existed.iter().filter(|x| needed.iter().find(|y| y == x).is_none()) {
     for cf in cfs_diff(&existed, &needed) {
         // Never drop default column families.
         if cf != CF_DEFAULT {
-            try!(db.drop_cf(cf));
+            db.drop_cf(cf)?;
         }
     }
 
     // Create needed column families not existed yet.
     for cf in cfs_diff(&needed, &existed) {
-        try!(
-            db.create_cf(
-                cf,
-                cfs_opts
-                    .iter()
-                    .find(|x| x.cf == cf)
-                    .unwrap()
-                    .options
-                    .clone()
-            )
-        );
+        db.create_cf((
+            cf,
+            cfs_opts
+                .iter()
+                .find(|x| x.cf == cf)
+                .unwrap()
+                .options
+                .clone(),
+        ))?;
     }
-
     Ok(db)
 }
 
@@ -218,6 +222,23 @@ pub fn get_engine_used_size(engine: Arc<DB>) -> u64 {
         }
     }
     used_size
+}
+
+pub fn get_engine_compression_ratio_at_level(
+    engine: &DB,
+    handle: &CFHandle,
+    level: usize,
+) -> Option<f64> {
+    let prop = format!("{}{}", ROCKSDB_COMPRESSION_RATIO_AT_LEVEL, level);
+    if let Some(v) = engine.get_property_value_cf(handle, &prop) {
+        if let Ok(f) = f64::from_str(&v) {
+            // RocksDB returns -1.0 if the level is empty.
+            if f >= 0.0 {
+                return Some(f);
+            }
+        }
+    }
+    None
 }
 
 pub struct FixedSuffixSliceTransform {
@@ -290,10 +311,10 @@ impl SliceTransform for NoopSliceTransform {
     }
 }
 
-pub fn delete_file_in_range(db: &DB, start_key: &[u8], end_key: &[u8]) -> Result<(), String> {
+pub fn roughly_cleanup_range(db: &DB, start_key: &[u8], end_key: &[u8]) -> Result<(), String> {
     if start_key > end_key {
         return Err(format!(
-            "[delete_file_in_range] start_key({:?}) should't larger than end_key({:?}).",
+            "[roughly_cleanup_in_range] start_key({:?}) should't larger than end_key({:?}).",
             start_key,
             end_key
         ));
@@ -304,42 +325,51 @@ pub fn delete_file_in_range(db: &DB, start_key: &[u8], end_key: &[u8]) -> Result
     }
 
     for cf in db.cf_names() {
-        let handle = try!(get_cf_handle(db, cf));
-
-        // Keys in CF_LOCK not have ts tail, at the same time DeleteFilesInRange treat
-        // input range as closed interval, but we don't want to delete the end_key, so
-        // we treat CF_LOCK especially. For the others column families: 1) the data set
-        // in these column families usually are very large, so we don't want to trigger
-        // seek for these column families; 2) keys in these column families have ts tail,
-        // so end_key never exists in these column families.
+        let handle = get_cf_handle(db, cf)?;
         if cf == CF_LOCK {
+            // Todo: use delete_files_in_range after rocksdb support [start, end) semantics.
             let mut iter_opt = ReadOptions::new();
             iter_opt.fill_cache(false);
+            iter_opt.set_iterate_upper_bound(end_key);
             let mut iter = db.iter_cf_opt(handle, iter_opt);
-            iter.seek_for_prev(end_key.into());
-            if iter.valid() {
-                if iter.key() == end_key {
-                    iter.prev();
-                }
-
-                if iter.valid() && iter.key() > start_key {
-                    try!(db.delete_file_in_range_cf(handle, start_key, iter.key()));
-                }
+            iter.seek(start_key.into());
+            let wb = WriteBatch::new();
+            while iter.valid() {
+                wb.delete_cf(handle, iter.key())?;
+                iter.next();
+            }
+            if wb.count() > 0 {
+                db.write(wb)?;
             }
         } else {
-            try!(db.delete_file_in_range_cf(handle, start_key, end_key));
+            db.delete_file_in_range_cf(handle, start_key, end_key)?;
         }
     }
 
     Ok(())
 }
 
+/// Compact the cf in the specified range by manual or not.
+pub fn compact_range(
+    db: &DB,
+    handle: &CFHandle,
+    start_key: Option<&[u8]>,
+    end_key: Option<&[u8]>,
+    exclusive_manual: bool,
+) {
+    let mut compact_opts = CompactOptions::new();
+    // `exclusive_manual == false` means manual compaction can
+    // concurrently run with other backgroud compactions.
+    compact_opts.set_exclusive_manual_compaction(exclusive_manual);
+    db.compact_range_cf_opt(handle, &compact_opts, start_key, end_key);
+}
+
 #[cfg(test)]
 mod tests {
-    use rocksdb::{ColumnFamilyOptions, DBOptions, DB};
+    use super::*;
+    use rocksdb::{ColumnFamilyOptions, DBOptions, Writable, DB};
     use tempdir::TempDir;
     use storage::CF_DEFAULT;
-    use super::{check_and_open, CFOptions};
 
     #[test]
     fn test_check_and_open() {
@@ -379,5 +409,21 @@ mod tests {
         cfs_existed.sort();
         cfs_excepted.sort();
         assert_eq!(cfs_existed, cfs_excepted);
+    }
+
+    #[test]
+    fn test_compression_ratio() {
+        let path = TempDir::new("_util_rocksdb_test_compression_ratio").expect("");
+        let path_str = path.path().to_str().unwrap();
+
+        let opts = DBOptions::new();
+        let cf_opts = CFOptions::new(CF_DEFAULT, ColumnFamilyOptions::new());
+        let db = check_and_open(path_str, opts, vec![cf_opts]).unwrap();
+        let cf = db.cf_handle(CF_DEFAULT).unwrap();
+
+        assert!(get_engine_compression_ratio_at_level(&db, cf, 0).is_none());
+        db.put_cf(cf, b"a", b"a").unwrap();
+        db.flush_cf(cf, true).unwrap();
+        assert!(get_engine_compression_ratio_at_level(&db, cf, 0).is_some());
     }
 }

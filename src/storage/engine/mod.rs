@@ -26,7 +26,6 @@ use kvproto::errorpb::Error as ErrorHeader;
 mod rocksdb;
 pub mod raftkv;
 mod metrics;
-use self::metrics::*;
 use super::super::raftstore::store::engine::IterOption;
 
 // only used for rocksdb without persistent.
@@ -42,6 +41,7 @@ const STAT_NEXT: &'static str = "next";
 const STAT_PREV: &'static str = "prev";
 const STAT_SEEK: &'static str = "seek";
 const STAT_SEEK_FOR_PREV: &'static str = "seek_for_prev";
+const STAT_OVER_SEEK_BOUND: &'static str = "over_seek_bound";
 
 pub type Callback<T> = Box<FnBox((CbContext, Result<T>)) + Send>;
 pub type BatchResults<T> = Vec<Option<(CbContext, Result<T>)>>;
@@ -156,12 +156,12 @@ pub trait Iterator {
 }
 
 macro_rules! near_loop {
-    ($cond:expr, $fallback:expr) => ({
+    ($cond:expr, $fallback:expr, $st:expr) => ({
         let mut cnt = 0;
         while $cond {
             cnt += 1;
             if cnt >= SEEK_BOUND {
-                CURSOR_OVER_SEEK_BOUND_COUNTER.inc();
+                $st.over_seek_bound += 1;
                 return $fallback;
             }
         }
@@ -186,6 +186,21 @@ pub struct CFStatistics {
     pub prev: usize,
     pub seek: usize,
     pub seek_for_prev: usize,
+    pub over_seek_bound: usize,
+    pub flow_stats: FlowStatistics,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct FlowStatistics {
+    pub read_keys: usize,
+    pub read_bytes: usize,
+}
+
+impl FlowStatistics {
+    pub fn add(&mut self, other: &Self) {
+        self.read_bytes = self.read_keys.saturating_add(other.read_bytes);
+        self.read_keys = self.read_keys.saturating_add(other.read_keys);
+    }
 }
 
 impl CFStatistics {
@@ -203,16 +218,19 @@ impl CFStatistics {
             (STAT_PREV, self.prev),
             (STAT_SEEK, self.seek),
             (STAT_SEEK_FOR_PREV, self.seek_for_prev),
+            (STAT_OVER_SEEK_BOUND, self.over_seek_bound),
         ]
     }
 
-    pub fn add_cf_statistics(&mut self, other: &Self) {
+    pub fn add(&mut self, other: &Self) {
         self.processed = self.processed.saturating_add(other.processed);
         self.get = self.get.saturating_add(other.get);
         self.next = self.next.saturating_add(other.next);
         self.prev = self.prev.saturating_add(other.prev);
         self.seek = self.seek.saturating_add(other.seek);
         self.seek_for_prev = self.seek_for_prev.saturating_add(other.seek_for_prev);
+        self.over_seek_bound = self.over_seek_bound.saturating_add(other.over_seek_bound);
+        self.flow_stats.add(&other.flow_stats);
     }
 }
 
@@ -240,10 +258,23 @@ impl Statistics {
         ]
     }
 
-    pub fn add_statistics(&mut self, other: &Self) {
-        self.lock.add_cf_statistics(&other.lock);
-        self.write.add_cf_statistics(&other.write);
-        self.data.add_cf_statistics(&other.data);
+    pub fn add(&mut self, other: &Self) {
+        self.lock.add(&other.lock);
+        self.write.add(&other.write);
+        self.data.add(&other.data);
+    }
+}
+
+#[derive(Default)]
+pub struct StatisticsSummary {
+    pub stat: Statistics,
+    pub count: u64,
+}
+
+impl StatisticsSummary {
+    pub fn add_statistics(&mut self, v: &Statistics) {
+        self.stat.add(v);
+        self.count += 1;
     }
 }
 
@@ -268,7 +299,7 @@ impl<'a> Cursor<'a> {
     pub fn seek(&mut self, key: &Key, statistics: &mut CFStatistics) -> Result<bool> {
         assert_ne!(self.scan_mode, ScanMode::Backward);
         if self.max_key.as_ref().map_or(false, |k| k <= key.encoded()) {
-            try!(self.iter.validate_key(key));
+            self.iter.validate_key(key)?;
             return Ok(false);
         }
 
@@ -280,7 +311,7 @@ impl<'a> Cursor<'a> {
 
         statistics.seek += 1;
 
-        if !try!(self.iter.seek(key)) {
+        if !self.iter.seek(key)? {
             self.max_key = Some(key.encoded().to_owned());
             return Ok(false);
         }
@@ -303,13 +334,14 @@ impl<'a> Cursor<'a> {
             return Ok(true);
         }
         if self.max_key.as_ref().map_or(false, |k| k <= key.encoded()) {
-            try!(self.iter.validate_key(key));
+            self.iter.validate_key(key)?;
             return Ok(false);
         }
         if ord == Ordering::Greater {
             near_loop!(
                 self.prev(statistics) && self.iter.key() > key.encoded().as_slice(),
-                self.seek(key, statistics)
+                self.seek(key, statistics),
+                statistics
             );
             if self.iter.valid() {
                 if self.iter.key() < key.encoded().as_slice() {
@@ -323,7 +355,8 @@ impl<'a> Cursor<'a> {
             // ord == Less
             near_loop!(
                 self.next(statistics) && self.iter.key() < key.encoded().as_slice(),
-                self.seek(key, statistics)
+                self.seek(key, statistics),
+                statistics
             );
         }
         if !self.iter.valid() {
@@ -339,12 +372,12 @@ impl<'a> Cursor<'a> {
     /// around `key`, otherwise you should `seek` first.
     pub fn get(&mut self, key: &Key, statistics: &mut CFStatistics) -> Result<Option<&[u8]>> {
         if self.scan_mode != ScanMode::Backward {
-            if try!(self.near_seek(key, statistics)) && self.iter.key() == &**key.encoded() {
+            if self.near_seek(key, statistics)? && self.iter.key() == &**key.encoded() {
                 return Ok(Some(self.iter.value()));
             }
             return Ok(None);
         }
-        if try!(self.near_seek_for_prev(key, statistics)) && self.iter.key() == &**key.encoded() {
+        if self.near_seek_for_prev(key, statistics)? && self.iter.key() == &**key.encoded() {
             return Ok(Some(self.iter.value()));
         }
         Ok(None)
@@ -353,7 +386,7 @@ impl<'a> Cursor<'a> {
     fn seek_for_prev(&mut self, key: &Key, statistics: &mut CFStatistics) -> Result<bool> {
         assert_ne!(self.scan_mode, ScanMode::Forward);
         if self.min_key.as_ref().map_or(false, |k| k >= key.encoded()) {
-            try!(self.iter.validate_key(key));
+            self.iter.validate_key(key)?;
             return Ok(false);
         }
 
@@ -364,7 +397,7 @@ impl<'a> Cursor<'a> {
         }
 
         statistics.seek_for_prev += 1;
-        if !try!(self.iter.seek_for_prev(key)) {
+        if !self.iter.seek_for_prev(key)? {
             self.min_key = Some(key.encoded().to_owned());
             return Ok(false);
         }
@@ -385,14 +418,15 @@ impl<'a> Cursor<'a> {
         }
 
         if self.min_key.as_ref().map_or(false, |k| k >= key.encoded()) {
-            try!(self.iter.validate_key(key));
+            self.iter.validate_key(key)?;
             return Ok(false);
         }
 
         if ord == Ordering::Less {
             near_loop!(
                 self.next(statistics) && self.iter.key() < key.encoded().as_slice(),
-                self.seek_for_prev(key, statistics)
+                self.seek_for_prev(key, statistics),
+                statistics
             );
             if self.iter.valid() {
                 if self.iter.key() > key.encoded().as_slice() {
@@ -405,7 +439,8 @@ impl<'a> Cursor<'a> {
         } else {
             near_loop!(
                 self.prev(statistics) && self.iter.key() > key.encoded().as_slice(),
-                self.seek_for_prev(key, statistics)
+                self.seek_for_prev(key, statistics),
+                statistics
             );
         }
 
@@ -417,7 +452,7 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn reverse_seek(&mut self, key: &Key, statistics: &mut CFStatistics) -> Result<bool> {
-        if !try!(self.seek_for_prev(key, statistics)) {
+        if !self.seek_for_prev(key, statistics)? {
             return Ok(false);
         }
 
@@ -435,7 +470,7 @@ impl<'a> Cursor<'a> {
     /// This method assume the current position of cursor is
     /// around `key`, otherwise you should use `reverse_seek` instead.
     pub fn near_reverse_seek(&mut self, key: &Key, statistics: &mut CFStatistics) -> Result<bool> {
-        if !try!(self.near_seek_for_prev(key, statistics)) {
+        if !self.near_seek_for_prev(key, statistics)? {
             return Ok(false);
         }
 

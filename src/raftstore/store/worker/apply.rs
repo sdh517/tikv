@@ -18,6 +18,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::collections::VecDeque;
 
 use rocksdb::{Writable, WriteBatch, DB};
+use rocksdb::rocksdb_options::WriteOptions;
 use protobuf::RepeatedField;
 
 use kvproto::metapb::{Peer as PeerMeta, Region};
@@ -28,7 +29,7 @@ use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, AdminResponse, ChangePeerR
 
 use util::worker::Runnable;
 use util::{escape, rocksdb};
-use util::time::SlowTimer;
+use util::time::{duration_to_sec, SlowTimer};
 use util::collections::{HashMap, HashMapEntry as MapEntry};
 use storage::{ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT};
 use raftstore::{Error, Result};
@@ -170,6 +171,7 @@ struct ApplyContext<'a> {
     pub cbs: Vec<(Callback, RaftCmdResponse)>,
     pub wb_last_bytes: u64,
     pub wb_last_keys: u64,
+    pub sync_log: bool,
 }
 
 impl<'a> ApplyContext<'a> {
@@ -180,6 +182,7 @@ impl<'a> ApplyContext<'a> {
             cbs: vec![],
             wb_last_bytes: 0,
             wb_last_keys: 0,
+            sync_log: false,
         }
     }
 
@@ -333,9 +336,7 @@ impl ApplyDelegate {
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
         // others will be saved as a normal entry with no data, so we must re-propose these
         // commands again.
-        let t = SlowTimer::new();
         let mut results = vec![];
-        let committed_count = committed_entries.len();
         for entry in committed_entries {
             if self.pending_remove {
                 // This peer is about to be destroyed, skip everything.
@@ -369,12 +370,6 @@ impl ApplyDelegate {
         self.update_metrics(apply_ctx);
         apply_ctx.mark_last_bytes_and_keys();
 
-        slow_log!(
-            t,
-            "{} handle ready {} committed entries",
-            self.tag,
-            committed_count
-        );
         results
     }
 
@@ -521,6 +516,10 @@ impl ApplyDelegate {
                 "{} processing raft command needs a none zero index",
                 self.tag
             );
+        }
+
+        if cmd.has_admin_request() {
+            apply_ctx.sync_log = true;
         }
 
         let cmd_cb = self.find_cb(index, term, &cmd);
@@ -675,7 +674,7 @@ impl ApplyDelegate {
         &mut self,
         ctx: &mut ExecContext,
     ) -> Result<(RaftCmdResponse, Option<ExecResult>)> {
-        try!(check_epoch(&self.region, ctx.req));
+        check_epoch(&self.region, ctx.req)?;
         if ctx.req.has_admin_request() {
             self.exec_admin_cmd(ctx)
         } else {
@@ -697,7 +696,7 @@ impl ApplyDelegate {
             ctx.index
         );
 
-        let (mut response, exec_result) = try!(match cmd_type {
+        let (mut response, exec_result) = match cmd_type {
             AdminCmdType::ChangePeer => self.exec_change_peer(ctx, request),
             AdminCmdType::Split => self.exec_split(ctx, request),
             AdminCmdType::CompactLog => self.exec_compact_log(ctx, request),
@@ -705,7 +704,7 @@ impl ApplyDelegate {
             AdminCmdType::ComputeHash => self.exec_compute_hash(ctx, request),
             AdminCmdType::VerifyHash => self.exec_verify_hash(ctx, request),
             AdminCmdType::InvalidAdmin => Err(box_err!("unsupported admin command type")),
-        });
+        }?;
         response.set_cmd_type(cmd_type);
 
         let mut resp = RaftCmdResponse::new();
@@ -855,7 +854,7 @@ impl ApplyDelegate {
             return Err(box_err!("invalid split request: {:?}", split_req));
         }
 
-        try!(util::check_key_in_region(split_key, &region));
+        util::check_key_in_region(split_key, &region)?;
 
         info!(
             "{} split at key: {}, region: {:?}",
@@ -985,12 +984,7 @@ impl ApplyDelegate {
         }
 
         // compact failure is safe to be omitted, no need to assert.
-        try!(compact_raft_log(
-            &self.tag,
-            &mut ctx.apply_state,
-            compact_index,
-            compact_term
-        ));
+        compact_raft_log(&self.tag, &mut ctx.apply_state, compact_index, compact_term)?;
 
         PEER_ADMIN_CMD_COUNTER_VEC
             .with_label_values(&["compact", "success"])
@@ -1015,7 +1009,7 @@ impl ApplyDelegate {
         let mut ranges = vec![];
         for req in requests {
             let cmd_type = req.get_cmd_type();
-            let mut resp = try!(match cmd_type {
+            let mut resp = match cmd_type {
                 CmdType::Put => self.handle_put(ctx, req),
                 CmdType::Delete => self.handle_delete(ctx, req),
                 CmdType::DeleteRange => self.handle_delete_range(req, &mut ranges),
@@ -1030,7 +1024,7 @@ impl ApplyDelegate {
                 CmdType::Prewrite | CmdType::Invalid => {
                     Err(box_err!("invalid cmd type, message maybe currupted"))
                 }
-            });
+            }?;
 
             resp.set_cmd_type(cmd_type);
 
@@ -1051,7 +1045,7 @@ impl ApplyDelegate {
 
     fn handle_put(&mut self, ctx: &ExecContext, req: &Request) -> Result<Response> {
         let (key, value) = (req.get_put().get_key(), req.get_put().get_value());
-        try!(check_data_key(key, &self.region));
+        check_data_key(key, &self.region)?;
 
         let resp = Response::new();
         let key = keys::data_key(key);
@@ -1093,7 +1087,7 @@ impl ApplyDelegate {
 
     fn handle_delete(&mut self, ctx: &ExecContext, req: &Request) -> Result<Response> {
         let key = req.get_delete().get_key();
-        try!(check_data_key(key, &self.region));
+        check_data_key(key, &self.region)?;
 
         let key = keys::data_key(key);
         // since size_diff_hint is not accurate, so we just skip calculate the value size.
@@ -1134,7 +1128,7 @@ impl ApplyDelegate {
                 e_key
             ));
         }
-        try!(check_data_key(s_key, &self.region));
+        check_data_key(s_key, &self.region)?;
         let end_key = keys::data_end_key(e_key);
         let region_end_key = keys::data_end_key(self.region.get_end_key());
         if end_key > region_end_key {
@@ -1198,7 +1192,7 @@ pub fn get_change_peer_cmd(msg: &RaftCmdRequest) -> Option<&ChangePeerRequest> {
 
 fn check_data_key(key: &[u8], region: &Region) -> Result<()> {
     // region key range has no data prefix, so we must use origin key to check.
-    try!(util::check_key_in_region(key, region));
+    util::check_key_in_region(key, region)?;
 
     Ok(())
 }
@@ -1206,7 +1200,7 @@ fn check_data_key(key: &[u8], region: &Region) -> Result<()> {
 pub fn do_get(tag: &str, region: &Region, snap: &Snapshot, req: &Request) -> Result<Response> {
     // TODO: the get_get looks wried, maybe we should figure out a better name later.
     let key = req.get_get().get_key();
-    try!(check_data_key(key, region));
+    check_data_key(key, region)?;
 
     let mut resp = Response::new();
     let res = if req.get_get().has_cf() {
@@ -1426,10 +1420,12 @@ pub struct Runner {
     host: Arc<CoprocessorHost>,
     delegates: HashMap<u64, ApplyDelegate>,
     notifier: Sender<TaskRes>,
+    sync_log: bool,
+    tag: String,
 }
 
 impl Runner {
-    pub fn new<T, C>(store: &Store<T, C>, notifier: Sender<TaskRes>) -> Runner {
+    pub fn new<T, C>(store: &Store<T, C>, notifier: Sender<TaskRes>, sync_log: bool) -> Runner {
         let mut delegates =
             HashMap::with_capacity_and_hasher(store.get_peers().len(), Default::default());
         for (&region_id, p) in store.get_peers() {
@@ -1440,14 +1436,17 @@ impl Runner {
             host: store.coprocessor_host.clone(),
             delegates: delegates,
             notifier: notifier,
+            sync_log: sync_log,
+            tag: format!("[store {}]", store.store_id()),
         }
     }
 
     fn handle_applies(&mut self, applys: Vec<Apply>) {
-        let _timer = STORE_APPLY_LOG_HISTOGRAM.start_coarse_timer();
+        let t = SlowTimer::new();
 
         let mut applys_res = Vec::with_capacity(applys.len());
         let mut apply_ctx = ApplyContext::new(self.host.as_ref());
+        let mut committed_count = 0;
         for apply in applys {
             if apply.entries.is_empty() {
                 continue;
@@ -1463,6 +1462,7 @@ impl Runner {
                 let delegate = e.get_mut();
                 delegate.metrics = ApplyMetrics::default();
                 delegate.term = apply.term;
+                committed_count += apply.entries.len();
                 let results = delegate.handle_raft_committed_entries(&mut apply_ctx, apply.entries);
 
                 if delegate.pending_remove {
@@ -1483,8 +1483,14 @@ impl Runner {
         }
 
         // Write to engine
+        // raftsotre.sync-log = true means we need prevent data loss when power failure.
+        // take raft log gc for example, we write kv WAL first, then write raft WAL,
+        // if power failure happen, raft WAL may synced to disk, but kv WAL may not.
+        // so we use sync-log flag here.
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(self.sync_log && apply_ctx.sync_log);
         self.db
-            .write(apply_ctx.wb.take().unwrap())
+            .write_opt(apply_ctx.wb.take().unwrap(), &write_opts)
             .unwrap_or_else(|e| panic!("failed to write to engine, error: {:?}", e));
 
         // Call callbacks
@@ -1495,6 +1501,15 @@ impl Runner {
         if !applys_res.is_empty() {
             self.notifier.send(TaskRes::Applys(applys_res)).unwrap();
         }
+
+        STORE_APPLY_LOG_HISTOGRAM.observe(duration_to_sec(t.elapsed()) as f64);
+
+        slow_log!(
+            t,
+            "{} handle ready {} committed entries",
+            self.tag,
+            committed_count
+        );
     }
 
     fn handle_proposals(&mut self, proposals: Vec<RegionProposal>) {
@@ -1608,6 +1623,8 @@ mod tests {
             host: host,
             delegates: HashMap::default(),
             notifier: tx,
+            sync_log: false,
+            tag: "".to_owned(),
         }
     }
 
@@ -1651,7 +1668,7 @@ mod tests {
     fn test_basic_flow() {
         let (tx, rx) = mpsc::channel();
         let (_tmp, db) = create_tmp_engine("apply-basic");
-        let host = Arc::new(CoprocessorHost::new());
+        let host = Arc::new(CoprocessorHost::default());
         let mut runner = new_runner(db.clone(), host, tx);
 
         let mut reg = Registration::default();
@@ -1891,7 +1908,7 @@ mod tests {
             .epoch(1, 3)
             .capture_resp(&mut delegate, tx.clone())
             .build();
-        let host = CoprocessorHost::new();
+        let host = CoprocessorHost::default();
         let mut apply_ctx = ApplyContext::new(&host);
         let res = delegate.handle_raft_committed_entries(&mut apply_ctx, vec![put_entry]);
         db.write(apply_ctx.wb.take().unwrap()).unwrap();

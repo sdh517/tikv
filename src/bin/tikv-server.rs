@@ -28,7 +28,6 @@ extern crate tikv;
 #[macro_use]
 extern crate log;
 extern crate rocksdb;
-extern crate mio;
 extern crate toml;
 extern crate libc;
 extern crate fs2;
@@ -37,13 +36,7 @@ extern crate signal;
 #[cfg(unix)]
 extern crate nix;
 extern crate prometheus;
-extern crate sys_info;
-extern crate futures;
 extern crate serde_json;
-extern crate tokio_core;
-#[cfg(test)]
-extern crate tempdir;
-extern crate grpcio as grpc;
 
 mod signal_handler;
 #[cfg(unix)]
@@ -69,14 +62,16 @@ use tikv::util::collections::HashMap;
 use tikv::util::logger::{self, StderrLogger};
 use tikv::util::file_log::RotatingFileLogger;
 use tikv::util::transport::SendCh;
+use tikv::util::worker::FutureWorker;
 use tikv::storage::DEFAULT_ROCKSDB_SUB_DIR;
 use tikv::server::{create_raft_storage, Node, Server, DEFAULT_CLUSTER_ID};
 use tikv::server::transport::ServerRaftStoreRouter;
 use tikv::server::resolve;
 use tikv::raftstore::store::{self, Engines, SnapManager};
+use tikv::raftstore::coprocessor::CoprocessorHost;
 use tikv::pd::{PdClient, RpcClient};
 use tikv::util::time::Monitor;
-use tikv::util::rocksdb::metrics_flusher::{MetricsFlusher, DEFAULT_FLUSER_INTERVAL};
+use tikv::util::rocksdb::metrics_flusher::{MetricsFlusher, DEFAULT_FLUSHER_INTERVAL};
 
 const RESERVED_OPEN_FDS: u64 = 1000;
 
@@ -170,8 +165,8 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
     let mut event_loop = store::create_event_loop(&cfg.raft_store)
         .unwrap_or_else(|e| fatal!("failed to create event loop: {:?}", e));
     let store_sendch = SendCh::new(event_loop.channel(), "raftstore");
-    let raft_router = ServerRaftStoreRouter::new(store_sendch.clone());
-    let (snap_status_sender, snap_status_receiver) = mpsc::channel();
+    let (significant_msg_sender, significant_msg_receiver) = mpsc::channel();
+    let raft_router = ServerRaftStoreRouter::new(store_sendch.clone(), significant_msg_sender);
 
     // Create kv engine, storage.
     let kv_db_opts = cfg.rocksdb.build_opt();
@@ -183,25 +178,6 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
     let mut storage = create_raft_storage(raft_router.clone(), kv_engine.clone(), &cfg.storage)
         .unwrap_or_else(|e| fatal!("failed to create raft stroage: {:?}", e));
 
-    // Create pd client, snapshot manager, server.
-    let pd_client = Arc::new(pd_client);
-    let (mut worker, resolver) = resolve::new_resolver(pd_client.clone())
-        .unwrap_or_else(|e| fatal!("failed to start address resolver: {:?}", e));
-    let snap_mgr = SnapManager::new(
-        snap_path.as_path().to_str().unwrap().to_owned(),
-        Some(store_sendch),
-    );
-    let mut server = Server::new(
-        &cfg.server,
-        cfg.raft_store.region_split_size.0 as usize,
-        storage.clone(),
-        raft_router,
-        snap_status_sender,
-        resolver,
-        snap_mgr.clone(),
-    ).unwrap_or_else(|e| fatal!("failed to create server: {:?}", e));
-    let trans = server.transport();
-
     // Create raft engine.
     let raft_db_opts = cfg.raftdb.build_opt();
     let raft_db_cf_opts = cfg.raftdb.build_cf_opts();
@@ -212,15 +188,45 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
             raft_db_cf_opts,
         ).unwrap_or_else(|s| fatal!("failed to create raft engine: {:?}", s)),
     );
+    let engines = Engines::new(kv_engine.clone(), raft_engine.clone());
+
+    // Create pd client and pd work, snapshot manager, server.
+    let pd_client = Arc::new(pd_client);
+    let pd_worker = FutureWorker::new("pd worker");
+    let (mut worker, resolver) = resolve::new_resolver(pd_client.clone())
+        .unwrap_or_else(|e| fatal!("failed to start address resolver: {:?}", e));
+    let snap_mgr = SnapManager::new(
+        snap_path.as_path().to_str().unwrap().to_owned(),
+        Some(store_sendch),
+    );
+
+    // Create server
+    let mut server = Server::new(
+        &cfg.server,
+        cfg.coprocessor.region_split_size.0 as usize,
+        storage.clone(),
+        raft_router,
+        resolver,
+        snap_mgr.clone(),
+        pd_worker.scheduler(),
+        Some(engines.clone()),
+    ).unwrap_or_else(|e| fatal!("failed to create server: {:?}", e));
+    let trans = server.transport();
+
     // Create node.
     let mut node = Node::new(&mut event_loop, &cfg.server, &cfg.raft_store, pd_client);
-    let engines = Engines::new(kv_engine.clone(), raft_engine.clone());
+
+    // Create CoprocessorHost.
+    let coprocessor_host = CoprocessorHost::new(cfg.coprocessor.clone(), node.get_sendch());
+
     node.start(
         event_loop,
         engines.clone(),
         trans,
         snap_mgr,
-        snap_status_receiver,
+        significant_msg_receiver,
+        pd_worker,
+        coprocessor_host,
     ).unwrap_or_else(|e| fatal!("failed to start node: {:?}", e));
     initial_metric(&cfg.metric, Some(node.id()));
 
@@ -232,7 +238,7 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig) {
 
     let mut metrics_flusher = MetricsFlusher::new(
         engines.clone(),
-        Duration::from_millis(DEFAULT_FLUSER_INTERVAL),
+        Duration::from_millis(DEFAULT_FLUSHER_INTERVAL),
     );
 
     // Start metrics flusher
@@ -442,8 +448,8 @@ fn main() {
                 .map_err::<Box<Error>, _>(|e| Box::new(e))
                 .and_then(|mut f| {
                     let mut s = String::new();
-                    try!(f.read_to_string(&mut s));
-                    let c = try!(toml::from_str(&s));
+                    f.read_to_string(&mut s)?;
+                    let c = toml::from_str(&s)?;
                     Ok(c)
                 })
                 .unwrap_or_else(|e| {
@@ -454,10 +460,9 @@ fn main() {
 
     overwrite_config_with_cmd_args(&mut config, &matches);
 
-    if let Err(e) = config.validate() {
-        fatal!("invalid configuration: {:?}", e);
-    }
-
+    // Sets the global logger ASAP.
+    // It is okay to use the config w/o `validata()`,
+    // because `init_log()` handles various conditions.
     init_log(&config);
 
     // Print version information.
@@ -465,6 +470,10 @@ fn main() {
 
     panic_hook::set_exit_hook();
 
+    config.compatible_adjust();
+    if let Err(e) = config.validate() {
+        fatal!("invalid configuration: {:?}", e);
+    }
     info!(
         "using config: {}",
         serde_json::to_string_pretty(&config).unwrap()

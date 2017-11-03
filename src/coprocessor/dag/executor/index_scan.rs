@@ -66,12 +66,31 @@ impl<'a> IndexScanExecutor<'a> {
         }
     }
 
+    pub fn new_with_cols_len(
+        cols: i64,
+        key_ranges: Vec<KeyRange>,
+        store: SnapshotStore<'a>,
+        statistics: &'a mut Statistics,
+    ) -> IndexScanExecutor<'a> {
+        let col_ids: Vec<i64> = (0..cols).collect();
+        COPR_EXECUTOR_COUNT.with_label_values(&["idxscan"]).inc();
+        let scanner = Scanner::new(store, false, false, statistics);
+        IndexScanExecutor {
+            desc: false,
+            col_ids: col_ids,
+            scanner: scanner,
+            key_ranges: key_ranges,
+            cursor: Default::default(),
+            pk_col: None,
+        }
+    }
+
     pub fn get_row_from_range(&mut self) -> Result<Option<Row>> {
         let range = &self.key_ranges[self.cursor];
         if range.get_start() > range.get_end() {
             return Ok(None);
         }
-        let kv = try!(self.scanner.next_row(range));
+        let kv = self.scanner.next_row(range)?;
         let (key, value) = match kv {
             Some((key, value)) => (key, value),
             None => return Ok(None),
@@ -109,7 +128,7 @@ impl<'a> IndexScanExecutor<'a> {
 impl<'a> Executor for IndexScanExecutor<'a> {
     fn next(&mut self) -> Result<Option<Row>> {
         while self.cursor < self.key_ranges.len() {
-            let data = try!(self.get_row_from_range());
+            let data = self.get_row_from_range()?;
             if data.is_none() {
                 CORP_GET_OR_SCAN_COUNT.with_label_values(&["range"]).inc();
                 self.scanner.set_seek_key(None);
@@ -250,7 +269,7 @@ mod test {
         r2.set_end(end_key.clone());
         wrapper.ranges = vec![r1, r2];
         let (snapshot, start_ts) = wrapper.store.get_snapshot();
-        let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI);
+        let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
 
         let mut scanner =
             IndexScanExecutor::new(wrapper.scan, wrapper.ranges, store, &mut statistics);
@@ -281,7 +300,7 @@ mod test {
         wrapper.ranges = vec![r1, r2, r3];
 
         let (snapshot, start_ts) = wrapper.store.get_snapshot();
-        let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI);
+        let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
 
         let mut scanner =
             IndexScanExecutor::new(wrapper.scan, wrapper.ranges, store, &mut statistics);
@@ -306,7 +325,7 @@ mod test {
         let mut statistics = Statistics::default();
         let mut wrapper = IndexTestWrapper::include_pk_cols();
         let (snapshot, start_ts) = wrapper.store.get_snapshot();
-        let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI);
+        let store = SnapshotStore::new(snapshot, start_ts, IsolationLevel::SI, true);
 
         let mut scanner =
             IndexScanExecutor::new(wrapper.scan, wrapper.ranges, store, &mut statistics);

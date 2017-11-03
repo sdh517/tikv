@@ -12,6 +12,7 @@ grpc-raft-conn-num = 123
 grpc-stream-initial-window-size = 12345
 end-point-concurrency = 12
 end-point-max-tasks = 12
+end-point-stack-size = "12MB"
 
 [server.labels]
 a = "b"
@@ -19,11 +20,12 @@ a = "b"
 [storage]
 data-dir = "/var"
 gc-ratio-threshold = 1.2
+max-key-size = 8192
 scheduler-notify-capacity = 123
 scheduler-messages-per-tick = 123
 scheduler-concurrency = 123
 scheduler-worker-pool-size = 1
-scheduler-too-busy-threshold = 123
+scheduler-pending-write-threshold = "123KB"
 
 [pd]
 endpoints = [
@@ -50,9 +52,7 @@ raft-log-gc-threshold = 12
 raft-log-gc-count-limit = 12
 raft-log-gc-size-limit = "1KB"
 split-region-check-tick-interval = "12s"
-region-max-size = "12MB"
-region-split-size = "12MB"
-region-split-check-diff = "12MB"
+region-split-check-diff = "6MB"
 region-compact-check-interval = "12s"
 region-compact-delete-keys-count = 1234
 pd-heartbeat-tick-interval = "12m"
@@ -72,6 +72,10 @@ raft-store-max-leader-lease = "12s"
 right-derive-when-split = false
 allow-remove-leader = true
 
+[coprocessor]
+region-max-size = "12MB"
+region-split-size = "12MB"
+
 [rocksdb]
 wal-recovery-mode = 1
 wal-dir = "/var"
@@ -89,6 +93,7 @@ info-log-max-size = "1KB"
 info-log-roll-time = "12s"
 info-log-dir = "/var"
 rate-bytes-per-sec = "1KB"
+wal-bytes-per-sync = "1MB"
 max-sub-compactions = 12
 writable-file-max-buffer-size = "12MB"
 use-direct-io-for-flush-and-compaction = true
@@ -99,10 +104,12 @@ backup-dir = "/var"
 block-size = "12KB"
 block-cache-size = "12GB"
 cache-index-and-filter-blocks = false
+pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
+read-amp-bytes-per-bit = 0
 compression-per-level = [
     "no",
     "no",
@@ -127,10 +134,12 @@ compaction-pri = 3
 block-size = "12KB"
 block-cache-size = "12GB"
 cache-index-and-filter-blocks = false
+pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
+read-amp-bytes-per-bit = 0
 compression-per-level = [
     "no",
     "no",
@@ -155,10 +164,12 @@ compaction-pri = 3
 block-size = "12KB"
 block-cache-size = "12GB"
 cache-index-and-filter-blocks = false
+pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
+read-amp-bytes-per-bit = 0
 compression-per-level = [
     "no",
     "no",
@@ -183,10 +194,12 @@ compaction-pri = 3
 block-size = "12KB"
 block-cache-size = "12GB"
 cache-index-and-filter-blocks = false
+pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
+read-amp-bytes-per-bit = 0
 compression-per-level = [
     "no",
     "no",
@@ -227,15 +240,18 @@ writable-file-max-buffer-size = "12MB"
 use-direct-io-for-flush-and-compaction = true
 enable-pipelined-write = false
 allow-concurrent-memtable-write = true
+wal-bytes-per-sync = "1MB"
 
 [raftdb.defaultcf]
 block-size = "12KB"
 block-cache-size = "12GB"
 cache-index-and-filter-blocks = false
+pin-l0-filter-and-index-blocks = false
 use-bloom-filter = false
 whole-key-filtering = true
 bloom-filter-bits-per-key = 123
 block-based-bloom-filter = true
+read-amp-bytes-per-bit = 0
 compression-per-level = [
     "no",
     "no",

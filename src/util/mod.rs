@@ -50,34 +50,23 @@ mod thread_metrics;
 
 pub const NO_LIMIT: u64 = u64::MAX;
 
-pub fn get_limit_at_size<'a, T, I>(entries: I, max: u64) -> usize
-where
-    T: Message + Clone,
-    I: IntoIterator<Item = &'a T>,
-{
-    let mut iter = entries.into_iter();
-    // If max is NO_LIMIT, we can return directly.
-    if max == NO_LIMIT {
-        return iter.count();
-    }
-
-    let mut size = match iter.next() {
-        None => return 0,
-        Some(e) => Message::compute_size(e) as u64,
-    };
-    let mut limit = 1;
-    for e in iter {
-        size += Message::compute_size(e) as u64;
-        if size > max {
-            break;
-        }
-        limit += 1;
-    }
-    limit
-}
-
 pub fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: u64) {
-    let limit = get_limit_at_size(entries.as_slice(), max);
+    if max == NO_LIMIT || entries.len() <= 1 {
+        return;
+    }
+
+    let mut size = 0;
+    let limit = entries
+        .iter()
+        .take_while(|&e| if size == 0 {
+            size += Message::compute_size(e) as u64;
+            true
+        } else {
+            size += Message::compute_size(e) as u64;
+            size <= max
+        })
+        .count();
+
     entries.truncate(limit);
 }
 
@@ -148,8 +137,8 @@ impl<T> HandyRwLock<T> for RwLock<T> {
 
 
 pub fn make_std_tcp_conn<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
-    let stream = try!(TcpStream::connect(addr));
-    try!(stream.set_nodelay(true));
+    let stream = TcpStream::connect(addr)?;
+    stream.set_nodelay(true)?;
     Ok(stream)
 }
 
@@ -157,7 +146,7 @@ pub fn make_std_tcp_conn<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
 // In mio example, it uses "127.0.0.1:80".parse() to get the SocketAddr,
 // but it is just ok for "ip:port", not "host:port".
 pub fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> io::Result<SocketAddr> {
-    let addrs = try!(addr.to_socket_addrs());
+    let addrs = addr.to_socket_addrs()?;
     Ok(addrs.collect::<Vec<SocketAddr>>()[0])
 }
 
@@ -269,7 +258,7 @@ impl<'a, T: 'a, V: 'a, E> TryInsertWith<'a, V, E> for Entry<'a, T, V> {
         match self {
             Entry::Occupied(e) => Ok(e.into_mut()),
             Entry::Vacant(e) => {
-                let v = try!(default());
+                let v = default()?;
                 Ok(e.insert(v))
             }
         }

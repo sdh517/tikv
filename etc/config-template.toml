@@ -35,6 +35,9 @@
 # max count of tasks being handled, new tasks will be rejected.
 # end-point-max-tasks = 2000
 
+# stack size of endpoint, complicated tasks may involve very deep recursion.
+# end-point-stack-size = "10MB"
+
 # set attributes about this server, e.g. { zone = "us-west-1", disk = "ssd" }.
 # labels = {}
 
@@ -54,6 +57,10 @@
 # scheduler's worker pool size, should increase it in heavy write cases,
 # also should less than total cpu cores.
 # scheduler-worker-pool-size = 4
+
+# When the pending write bytes exceeds this threshold,
+# the "scheduler too busy" error is displayed.
+# scheduler-pending-write-threshold = "100MB"
 
 [pd]
 # pd endpoints
@@ -88,14 +95,9 @@
 # Store heartbeat tick interval for reporting to pd.
 # pd-store-heartbeat-tick-interval = "10s"
 
-# When the region's size exceeds region-max-size, we will split the region
-# into two which the left region's size will be region-split-size or a little
-# bit smaller.
-# region-max-size = "384MB"
-# region-split-size = "256MB"
 # When region size changes exceeds region-split-check-diff, we should check
 # whether the region should be split or not.
-# region-split-check-diff = "32MB"
+# region-split-check-diff = "6MB"
 
 # Interval to check region whether need to be split or not.
 # split-region-check-tick-interval = "10s"
@@ -108,10 +110,10 @@
 # A threshold to gc stale raft log, must >= 1.
 # raft-log-gc-threshold = 50
 # When entry count exceed this value, gc will be forced trigger.
-# raft-log-gc-count-limit = 196608
+# raft-log-gc-count-limit = 72000
 # When the approximate size of raft log entries exceed this value, gc will be forced trigger.
 # It's recommanded to set it to 3/4 of region-split-size.
-# raft-log-gc-size-limit = "192MB"
+# raft-log-gc-size-limit = "72MB"
 
 # When a peer hasn't been active for max-peer-down-duration,
 # we will consider this peer to be down and report it to pd.
@@ -130,6 +132,13 @@
 
 # Interval (s) to check region whether the data are consistent.
 # consistency-check-interval = 0
+
+[coprocessor]
+# When the region's size exceeds region-max-size, we will split the region
+# into two which the left region's size will be region-split-size or a little
+# bit smaller.
+# region-max-size = "144MB"
+# region-split-size = "96MB"
 
 [rocksdb]
 # Maximum number of concurrent background jobs (compactions and flushes)
@@ -227,6 +236,9 @@
 # set backup path, if not set, use "backup" under store path.
 # backup-dir = "/tmp/tikv/store/backup"
 
+# Allows OS to incrementally sync WAL to disk while it is being written.
+# wal-bytes-per-sync = 0
+
 # Column Family default used to store actual data of the database.
 [rocksdb.defaultcf]
 # compression method (if any) is used to compress a block.
@@ -298,6 +310,18 @@
 # during table initialization.
 # cache-index-and-filter-blocks = true
 
+# Pin level0 filter and index blocks in cache.
+# pin-l0-filter-and-index-blocks = true
+
+# Enable read amplication statistics.
+# value  =>  memory usage (percentage of loaded blocks memory)
+# 1      =>  12.50 %
+# 2      =>  06.25 %
+# 4      =>  03.12 %
+# 8      =>  01.56 %
+# 16     =>  00.78 %
+# read-amp-bytes-per-bit = 0
+
 # Options for Column Family write
 # Column Family write used to store commit informations in MVCC model
 [rocksdb.writecf]
@@ -311,12 +335,13 @@
 
 # in normal cases should tune to 10%-30% system's total memory.
 # block-cache-size = "256MB"
-# cache-index-and-filter-blocks = true
 # level0-file-num-compaction-trigger = 4
 # level0-slowdown-writes-trigger = 20
 # level0-stop-writes-trigger = 36
 # cache-index-and-filter-blocks = true
+# pin-l0-filter-and-index-blocks = true
 # compaction-pri = 3
+# read-amp-bytes-per-bit = 0
 
 [rocksdb.lockcf]
 # compression-per-level = ["no", "no", "no", "no", "no", "no", "no"]
@@ -331,7 +356,9 @@
 # level0-slowdown-writes-trigger = 20
 # level0-stop-writes-trigger = 36
 # cache-index-and-filter-blocks = true
+# pin-l0-filter-and-index-blocks = true
 # compaction-pri = 0
+# read-amp-bytes-per-bit = 0
 
 [raftdb]
 # max-sub-compactions = 1
@@ -364,4 +391,7 @@
 # level0-slowdown-writes-trigger = 20
 # level0-stop-writes-trigger = 36
 # cache-index-and-filter-blocks = true
+# pin-l0-filter-and-index-blocks = true
 # compaction-pri = 0
+# read-amp-bytes-per-bit = 0
+# wal-bytes-per-sync = 0

@@ -26,14 +26,16 @@
 // limitations under the License.
 
 
+use std::mem;
+
 use raft::errors::{Error, Result};
 use raft::Storage;
 use protobuf::{self, RepeatedField};
 use kvproto::eraftpb::{ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState,
                        Message, MessageType, Snapshot};
-use raft::raft::{Config, Raft, SoftState, INVALID_ID};
-use raft::Status;
-use raft::read_only::ReadState;
+use super::raft::{Config, Raft, SoftState, INVALID_ID};
+use super::Status;
+use super::read_only::ReadState;
 
 #[derive(Debug, Default)]
 pub struct Peer {
@@ -111,6 +113,10 @@ pub struct Ready {
     // If it contains a MsgSnap message, the application MUST report back to raft
     // when the snapshot has been received or has failed by calling ReportSnapshot.
     pub messages: Vec<Message>,
+
+    // MustSync indicates whether the HardState and Entries must be synchronously
+    // written to disk or if an asynchronous write is permissible.
+    pub must_sync: bool,
 }
 
 impl Ready {
@@ -122,9 +128,11 @@ impl Ready {
     ) -> Ready {
         let mut rd = Ready {
             entries: raft.raft_log.unstable_entries().unwrap_or(&[]).to_vec(),
-            messages: raft.msgs.drain(..).collect(),
             ..Default::default()
         };
+        if !raft.msgs.is_empty() {
+            mem::swap(&mut raft.msgs, &mut rd.messages);
+        }
         rd.committed_entries = Some(
             (match since_idx {
                 None => raft.raft_log.next_entries(),
@@ -137,6 +145,9 @@ impl Ready {
         }
         let hs = raft.hard_state();
         if &hs != prev_hs {
+            if hs.get_vote() != prev_hs.get_vote() || hs.get_term() != prev_hs.get_term() {
+                rd.must_sync = true;
+            }
             rd.hs = Some(hs);
         }
         if raft.raft_log.get_unstable().snapshot.is_some() {
@@ -245,12 +256,15 @@ impl<T: Storage> RawNode<T> {
     }
 
     // Propose proposes data be appended to the raft log.
-    pub fn propose(&mut self, data: Vec<u8>) -> Result<()> {
+    pub fn propose(&mut self, data: Vec<u8>, sync_log: bool) -> Result<()> {
         let mut m = Message::new();
         m.set_msg_type(MessageType::MsgPropose);
         m.set_from(self.raft.id);
         let mut e = Entry::new();
         e.set_data(data);
+        if sync_log {
+            e.set_sync_log(true);
+        }
         m.set_entries(RepeatedField::from_vec(vec![e]));
         self.raft.step(m)
     }
@@ -263,6 +277,7 @@ impl<T: Storage> RawNode<T> {
         let mut e = Entry::new();
         e.set_entry_type(EntryType::EntryConfChange);
         e.set_data(data);
+        e.set_sync_log(true);
         m.set_entries(RepeatedField::from_vec(vec![e]));
         self.raft.step(m)
     }

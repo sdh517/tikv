@@ -12,15 +12,15 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use tipb::expression::{Expr, ExprType};
+use tipb::expression::ExprType;
 
 use coprocessor::codec::Datum;
 use coprocessor::Result;
 
 use super::xeval::{evaluator, EvalContext};
 
-pub fn build_aggr_func(expr: &Expr) -> Result<Box<AggrFunc>> {
-    match expr.get_tp() {
+pub fn build_aggr_func(tp: ExprType) -> Result<Box<AggrFunc>> {
+    match tp {
         ExprType::Count => Ok(box Count { c: 0 }),
         ExprType::First => Ok(box First { e: None }),
         ExprType::Sum => Ok(box Sum { res: None }),
@@ -118,7 +118,7 @@ impl Sum {
 
 impl AggrFunc for Sum {
     fn update(&mut self, ctx: &EvalContext, args: Vec<Datum>) -> Result<()> {
-        try!(self.add_asssign(ctx, args));
+        self.add_asssign(ctx, args)?;
         Ok(())
     }
 
@@ -141,7 +141,7 @@ struct Avg {
 
 impl AggrFunc for Avg {
     fn update(&mut self, ctx: &EvalContext, args: Vec<Datum>) -> Result<()> {
-        if try!(self.sum.add_asssign(ctx, args)) {
+        if self.sum.add_asssign(ctx, args)? {
             self.cnt += 1;
         }
         Ok(())

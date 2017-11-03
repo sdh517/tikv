@@ -20,6 +20,7 @@ pub struct SnapshotStore<'a> {
     snapshot: &'a Snapshot,
     start_ts: u64,
     isolation_level: IsolationLevel,
+    fill_cache: bool,
 }
 
 impl<'a> SnapshotStore<'a> {
@@ -27,11 +28,13 @@ impl<'a> SnapshotStore<'a> {
         snapshot: &'a Snapshot,
         start_ts: u64,
         isolation_level: IsolationLevel,
+        fill_cache: bool,
     ) -> SnapshotStore {
         SnapshotStore {
             snapshot: snapshot,
             start_ts: start_ts,
             isolation_level: isolation_level,
+            fill_cache: fill_cache,
         }
     }
 
@@ -40,11 +43,11 @@ impl<'a> SnapshotStore<'a> {
             self.snapshot,
             statistics,
             None,
-            true,
+            self.fill_cache,
             None,
             self.isolation_level,
         );
-        let v = try!(reader.get(key, self.start_ts));
+        let v = reader.get(key, self.start_ts)?;
         Ok(v)
     }
 
@@ -58,7 +61,7 @@ impl<'a> SnapshotStore<'a> {
             self.snapshot,
             statistics,
             None,
-            true,
+            self.fill_cache,
             None,
             self.isolation_level,
         );
@@ -82,7 +85,7 @@ impl<'a> SnapshotStore<'a> {
             self.snapshot,
             statistics,
             Some(mode),
-            true,
+            self.fill_cache,
             upper_bound,
             self.isolation_level,
         );
@@ -101,11 +104,11 @@ pub struct StoreScanner<'a> {
 
 impl<'a> StoreScanner<'a> {
     pub fn seek(&mut self, key: Key) -> Result<Option<(Key, Value)>> {
-        Ok(try!(self.reader.seek(key, self.start_ts)))
+        Ok(self.reader.seek(key, self.start_ts)?)
     }
 
     pub fn reverse_seek(&mut self, key: Key) -> Result<Option<(Key, Value)>> {
-        Ok(try!(self.reader.reverse_seek(key, self.start_ts)))
+        Ok(self.reader.reverse_seek(key, self.start_ts)?)
     }
 
     #[inline]
@@ -129,11 +132,11 @@ impl<'a> StoreScanner<'a> {
         while results.len() < limit {
             match self.seek(key) {
                 Ok(Some((k, v))) => {
-                    results.push(Ok((try!(k.raw()), v)));
+                    results.push(Ok((k.raw()?, v)));
                     key = k;
                 }
                 Ok(None) => break,
-                Err(Error::Mvcc(e)) => key = try!(StoreScanner::handle_mvcc_err(e, &mut results)),
+                Err(Error::Mvcc(e)) => key = StoreScanner::handle_mvcc_err(e, &mut results)?,
                 Err(e) => return Err(e),
             }
             key = key.append_ts(0);
@@ -146,11 +149,11 @@ impl<'a> StoreScanner<'a> {
         while results.len() < limit {
             match self.reverse_seek(key) {
                 Ok(Some((k, v))) => {
-                    results.push(Ok((try!(k.raw()), v)));
+                    results.push(Ok((k.raw()?, v)));
                     key = k;
                 }
                 Ok(None) => break,
-                Err(Error::Mvcc(e)) => key = try!(StoreScanner::handle_mvcc_err(e, &mut results)),
+                Err(Error::Mvcc(e)) => key = StoreScanner::handle_mvcc_err(e, &mut results)?,
                 Err(e) => return Err(e),
             }
         }
@@ -213,6 +216,7 @@ mod test {
                     START_TS,
                     None,
                     IsolationLevel::SI,
+                    true,
                 );
                 for key in &self.keys {
                     let key = key.as_bytes();
@@ -233,6 +237,7 @@ mod test {
                     START_TS,
                     None,
                     IsolationLevel::SI,
+                    true,
                 );
                 for key in &self.keys {
                     let key = key.as_bytes();
@@ -250,7 +255,12 @@ mod test {
         }
 
         fn store(&self) -> SnapshotStore {
-            SnapshotStore::new(self.snapshot.as_ref(), COMMIT_TS + 1, IsolationLevel::SI)
+            SnapshotStore::new(
+                self.snapshot.as_ref(),
+                COMMIT_TS + 1,
+                IsolationLevel::SI,
+                true,
+            )
         }
     }
 

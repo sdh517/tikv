@@ -23,7 +23,8 @@ use libc::{self, pid_t};
 pub fn monitor_threads<S: Into<String>>(namespace: S) -> Result<()> {
     let pid = unsafe { libc::getpid() };
     let tc = ThreadsColletcor::new(pid, namespace);
-    try!(prometheus::register(Box::new(tc)).map_err(|e| to_err(format!("{:?}", e))));
+    prometheus::register(Box::new(tc))
+        .map_err(|e| to_err(format!("{:?}", e)))?;
 
     Ok(())
 }
@@ -82,7 +83,7 @@ impl Collector for ThreadsColletcor {
 
 fn get_thread_ids(pid: pid_t) -> Result<Vec<pid_t>> {
     let mut tids = Vec::new();
-    let dirs = try!(fs::read_dir(format!("/proc/{}/task", pid)));
+    let dirs = fs::read_dir(format!("/proc/{}/task", pid))?;
     for task in dirs {
         let file_name = match task {
             Ok(t) => t.file_name(),
@@ -117,8 +118,8 @@ fn get_thread_name(tid: pid_t, stat: &str) -> Result<(String, usize)> {
     let end = stat.rfind(')');
 
     if let (Some(start), Some(end)) = (start, end) {
-        let mut name = String::with_capacity(THD_NAME_LEN);
         let raw = &stat[start + 1..end];
+        let mut name = String::with_capacity(raw.len());
 
         // sanitize thread name.
         for c in raw.chars() {
@@ -148,26 +149,20 @@ fn to_err(s: String) -> Error {
     Error::new(ErrorKind::Other, s)
 }
 
-// Thread name's length is restricted to 16 characters,
-// including the terminating null byte ('\0').
-const THD_NAME_LEN: usize = 16;
-
 // See more man proc.
 // Index of utime and stime.
 const CPU_INDEX: [usize; 2] = [14 - 1, 15 - 1];
 
 fn get_thread_stat(pid: pid_t, tid: pid_t) -> Result<(String, f64, f64)> {
     let mut stat = String::new();
-    try!(
-        fs::File::open(format!("/proc/{}/task/{}/stat", pid, tid))
-            .and_then(|mut f| f.read_to_string(&mut stat))
-    );
+    fs::File::open(format!("/proc/{}/task/{}/stat", pid, tid))
+        .and_then(|mut f| f.read_to_string(&mut stat))?;
     get_thread_stat_internal(tid, &stat)
 }
 
 // Extracted from `get_thread_stat`, for test purpose.
 fn get_thread_stat_internal(tid: pid_t, stat: &str) -> Result<(String, f64, f64)> {
-    let (name, end) = try!(get_thread_name(tid, stat));
+    let (name, end) = get_thread_name(tid, stat)?;
     let stats: Vec<_> = (&stat[end + 2..]).split_whitespace().collect(); // excluding ") ".
     let utime = stats[CPU_INDEX[0] - 2]; // pid and comm is truncated.
     let stime = stats[CPU_INDEX[1] - 2];

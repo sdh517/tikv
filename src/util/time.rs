@@ -14,7 +14,7 @@
 use std::time::{Duration, SystemTime};
 use std::thread::{self, Builder, JoinHandle};
 use std::sync::mpsc::{self, Sender};
-use std::ops::{Add, Sub};
+use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::cmp::Ordering;
 
 use time::{Duration as TimeDuration, Timespec};
@@ -278,7 +278,7 @@ impl Instant {
     // It is different from `elapsed_duration`, the resolution here is millisecond.
     // The processors in an SMP system do not start all at exactly the same time
     // and therefore the timer registers are typically running at an offset.
-    // Use millisecond resolution for ignoring the error, does not panic.
+    // Use millisecond resolution for ignoring the error.
     // See more: https://linux.die.net/man/2/clock_gettime
     fn elapsed_duration_coarse(later: Timespec, earlier: Timespec) -> Duration {
         let later_ms =
@@ -335,6 +335,12 @@ impl Add<Duration> for Instant {
     }
 }
 
+impl AddAssign<Duration> for Instant {
+    fn add_assign(&mut self, rhs: Duration) {
+        *self = self.add(rhs)
+    }
+}
+
 impl Sub<Duration> for Instant {
     type Output = Instant;
 
@@ -345,6 +351,12 @@ impl Sub<Duration> for Instant {
                 Instant::MonotonicCoarse(t - TimeDuration::from_std(other).unwrap())
             }
         }
+    }
+}
+
+impl SubAssign<Duration> for Instant {
+    fn sub_assign(&mut self, rhs: Duration) {
+        *self = self.sub(rhs)
     }
 }
 
@@ -452,9 +464,27 @@ mod tests {
         assert_eq!(late_raw - zero, late_raw);
         assert_eq!(late_coarse - zero, late_coarse);
 
+        // Sub asign Duration
+        let mut tmp_late_row = late_raw;
+        tmp_late_row -= zero;
+        assert_eq!(tmp_late_row, late_raw);
+
+        let mut tmp_late_coarse = late_coarse;
+        tmp_late_coarse -= zero;
+        assert_eq!(tmp_late_coarse, late_coarse);
+
         // Add Duration.
         assert_eq!(late_raw + zero, late_raw);
         assert_eq!(late_coarse + zero, late_coarse);
+
+        // add asign
+        let mut tmp_late_row = late_raw;
+        tmp_late_row += zero;
+        assert_eq!(tmp_late_row, late_raw);
+
+        let mut tmp_coarse = late_coarse;
+        tmp_coarse += zero;
+        assert_eq!(tmp_coarse, late_coarse);
 
         // PartialEq and PartialOrd
         let ts = Timespec::new(1, 1);

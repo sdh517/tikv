@@ -19,6 +19,7 @@ use log::LogLevelFilter;
 use rocksdb::{CompactionPriority, DBCompressionType, DBRecoveryMode};
 use tikv::server::Config as ServerConfig;
 use tikv::raftstore::store::Config as RaftstoreConfig;
+use tikv::raftstore::coprocessor::Config as CopConfig;
 use tikv::config::*;
 use tikv::storage::Config as StorageConfig;
 use tikv::util::config::{ReadableDuration, ReadableSize};
@@ -63,6 +64,7 @@ fn test_serde_custom_tikv_config() {
         grpc_stream_initial_window_size: ReadableSize(12_345),
         end_point_concurrency: 12,
         end_point_max_tasks: 12,
+        end_point_stack_size: ReadableSize::mb(12),
     };
     value.metric = MetricConfig {
         interval: ReadableDuration::secs(12),
@@ -84,9 +86,7 @@ fn test_serde_custom_tikv_config() {
         raft_log_gc_count_limit: 12,
         raft_log_gc_size_limit: ReadableSize::kb(1),
         split_region_check_tick_interval: ReadableDuration::secs(12),
-        region_max_size: ReadableSize::mb(12),
-        region_split_size: ReadableSize::mb(12),
-        region_split_check_diff: ReadableSize::mb(12),
+        region_split_check_diff: ReadableSize::mb(6),
         region_compact_check_interval: ReadableDuration::secs(12),
         region_compact_delete_keys_count: 1_234,
         pd_heartbeat_tick_interval: ReadableDuration::minutes(12),
@@ -105,6 +105,8 @@ fn test_serde_custom_tikv_config() {
         raft_store_max_leader_lease: ReadableDuration::secs(12),
         right_derive_when_split: false,
         allow_remove_leader: true,
+        region_max_size: ReadableSize(0),
+        region_split_size: ReadableSize(0),
     };
     value.pd = PdConfig {
         endpoints: vec!["example.com:443".to_owned()],
@@ -126,6 +128,7 @@ fn test_serde_custom_tikv_config() {
         info_log_roll_time: ReadableDuration::secs(12),
         info_log_dir: "/var".to_owned(),
         rate_bytes_per_sec: ReadableSize::kb(1),
+        wal_bytes_per_sync: ReadableSize::mb(1),
         max_sub_compactions: 12,
         writable_file_max_buffer_size: ReadableSize::mb(12),
         use_direct_io_for_flush_and_compaction: true,
@@ -135,10 +138,12 @@ fn test_serde_custom_tikv_config() {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
             cache_index_and_filter_blocks: false,
+            pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
             whole_key_filtering: true,
             bloom_filter_bits_per_key: 123,
             block_based_bloom_filter: true,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [
                 DBCompressionType::No,
                 DBCompressionType::No,
@@ -163,10 +168,12 @@ fn test_serde_custom_tikv_config() {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
             cache_index_and_filter_blocks: false,
+            pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
             whole_key_filtering: true,
             bloom_filter_bits_per_key: 123,
             block_based_bloom_filter: true,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [
                 DBCompressionType::No,
                 DBCompressionType::No,
@@ -191,10 +198,12 @@ fn test_serde_custom_tikv_config() {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
             cache_index_and_filter_blocks: false,
+            pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
             whole_key_filtering: true,
             bloom_filter_bits_per_key: 123,
             block_based_bloom_filter: true,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [
                 DBCompressionType::No,
                 DBCompressionType::No,
@@ -219,10 +228,12 @@ fn test_serde_custom_tikv_config() {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
             cache_index_and_filter_blocks: false,
+            pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
             whole_key_filtering: true,
             bloom_filter_bits_per_key: 123,
             block_based_bloom_filter: true,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [
                 DBCompressionType::No,
                 DBCompressionType::No,
@@ -264,14 +275,17 @@ fn test_serde_custom_tikv_config() {
         use_direct_io_for_flush_and_compaction: true,
         enable_pipelined_write: false,
         allow_concurrent_memtable_write: true,
+        wal_bytes_per_sync: ReadableSize::mb(1),
         defaultcf: RaftDefaultCfConfig {
             block_size: ReadableSize::kb(12),
             block_cache_size: ReadableSize::gb(12),
             cache_index_and_filter_blocks: false,
+            pin_l0_filter_and_index_blocks: false,
             use_bloom_filter: false,
             whole_key_filtering: true,
             bloom_filter_bits_per_key: 123,
             block_based_bloom_filter: true,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [
                 DBCompressionType::No,
                 DBCompressionType::No,
@@ -296,12 +310,17 @@ fn test_serde_custom_tikv_config() {
     value.storage = StorageConfig {
         data_dir: "/var".to_owned(),
         gc_ratio_threshold: 1.2,
+        max_key_size: 8192,
         scheduler_notify_capacity: 123,
 
         scheduler_messages_per_tick: 123,
         scheduler_concurrency: 123,
         scheduler_worker_pool_size: 1,
-        scheduler_too_busy_threshold: 123,
+        scheduler_pending_write_threshold: ReadableSize::kb(123),
+    };
+    value.coprocessor = CopConfig {
+        region_max_size: ReadableSize::mb(12),
+        region_split_size: ReadableSize::mb(12),
     };
 
     let custom = read_file_in_project_dir("tests/config/test-custom.toml");

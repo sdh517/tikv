@@ -12,13 +12,11 @@
 // limitations under the License.
 
 #![crate_type = "lib"]
-#![feature(test)]
+#![cfg_attr(test, feature(test))]
 #![feature(fnbox)]
-#![feature(fn_traits)]
 #![feature(alloc)]
 #![feature(slice_patterns)]
 #![feature(box_syntax)]
-#![feature(iterator_step_by)]
 #![cfg_attr(feature = "dev", feature(plugin))]
 #![cfg_attr(feature = "dev", plugin(clippy))]
 #![cfg_attr(not(feature = "dev"), allow(unknown_lints))]
@@ -36,6 +34,7 @@
 extern crate log;
 #[macro_use]
 extern crate quick_error;
+#[cfg(test)]
 extern crate test;
 extern crate protobuf;
 extern crate byteorder;
@@ -46,11 +45,8 @@ extern crate rocksdb;
 extern crate kvproto;
 extern crate time;
 extern crate tipb;
-extern crate num;
 extern crate libc;
 extern crate crc;
-#[cfg(unix)]
-extern crate nix;
 extern crate alloc;
 extern crate chrono;
 #[macro_use]
@@ -63,17 +59,23 @@ extern crate fs2;
 extern crate regex;
 extern crate grpcio as grpc;
 extern crate fnv;
-extern crate ordermap;
 extern crate flat_map;
 extern crate futures;
+extern crate futures_cpupool;
 extern crate tokio_core;
 extern crate tokio_timer;
 extern crate serde_json;
 extern crate serde;
+extern crate murmur3;
 #[macro_use]
 extern crate serde_derive;
+#[cfg(test)]
 extern crate toml;
 extern crate sys_info;
+#[cfg(test)]
+extern crate utime;
+#[macro_use]
+extern crate fail;
 
 #[macro_use]
 pub mod util;

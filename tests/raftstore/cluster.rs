@@ -36,7 +36,6 @@ use tikv::pd::PdClient;
 use tikv::util::{escape, rocksdb, HandyRwLock};
 use tikv::util::transport::SendCh;
 use super::pd::TestPdClient;
-use tikv::raftstore::store::keys::data_key;
 use super::transport_simulate::*;
 
 // We simulate 3 or 5 nodes, each has a store.
@@ -384,7 +383,7 @@ impl<T: Simulator> Cluster<T> {
         }
 
         for engines in self.engines.values() {
-            try!(write_prepare_bootstrap(engines, &region));
+            write_prepare_bootstrap(engines, &region)?;
         }
 
         self.bootstrap_cluster(region);
@@ -734,18 +733,21 @@ impl<T: Simulator> Cluster<T> {
         }
     }
 
-    pub fn ask_split(&mut self, region: &metapb::Region, split_key: &[u8]) {
-        // Now we can't control split easily in pd, so here we use store send channel
-        // directly to send the AskSplit request.
+    // It's similar to `ask_split`, the difference is the msg, it sends, is `Msg::SplitRegion`,
+    // and `region` will not be embedded to that msg.
+    // Caller must ensure that the `split_key` is in the `region`.
+    pub fn split_region(&mut self, region: &metapb::Region, split_key: &[u8], cb: Callback) {
         let leader = self.leader_of_region(region.get_id()).unwrap();
         let ch = self.sim
             .rl()
             .get_store_sendch(leader.get_store_id())
             .unwrap();
-        ch.try_send(Msg::SplitCheckResult {
+        let split_key = split_key.to_vec();
+        ch.try_send(Msg::SplitRegion {
             region_id: region.get_id(),
-            epoch: region.get_region_epoch().clone(),
-            split_key: data_key(split_key),
+            region_epoch: region.get_region_epoch().clone(),
+            split_key: split_key.clone(),
+            callback: Some(cb),
         }).unwrap();
     }
 
@@ -756,7 +758,24 @@ impl<T: Simulator> Cluster<T> {
             // In case ask split message is ignored, we should retry.
             if try_cnt % 50 == 0 {
                 self.reset_leader_of_region(region.get_id());
-                self.ask_split(region, split_key);
+                let key = split_key.to_vec();
+                let check = Box::new(move |mut resp: RaftCmdResponse| {
+                    if resp.get_header().has_error() {
+                        let error = resp.get_header().get_error();
+                        if error.has_stale_epoch() || error.has_not_leader() {
+                            warn!("fail to split: {:?}, ignore.", error);
+                            return;
+                        }
+                        panic!("failed to split: {:?}", error);
+                    }
+                    let admin_resp = resp.mut_admin_response();
+                    let split_resp = admin_resp.mut_split();
+                    let mut left = split_resp.take_left();
+                    let mut right = split_resp.take_right();
+                    assert_eq!(left.get_end_key(), key.as_slice());
+                    assert_eq!(left.take_end_key(), right.take_start_key());
+                });
+                self.split_region(region, split_key, check);
             }
 
             if self.pd_client.check_split(region, split_key) &&

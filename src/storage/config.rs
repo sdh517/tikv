@@ -15,15 +15,21 @@ use std::error::Error;
 
 use sys_info;
 
-use util::config;
+use util::config::{self, ReadableSize};
 
 pub const DEFAULT_DATA_DIR: &'static str = "";
 pub const DEFAULT_ROCKSDB_SUB_DIR: &'static str = "db";
 const DEFAULT_GC_RATIO_THRESHOLD: f64 = 1.1;
+const DEFAULT_MAX_KEY_SIZE: usize = 4 * 1024;
 const DEFAULT_SCHED_CAPACITY: usize = 10240;
 const DEFAULT_SCHED_MSG_PER_TICK: usize = 1024;
 const DEFAULT_SCHED_CONCURRENCY: usize = 102400;
-const DEFAULT_SCHED_TOO_BUSY_THRESHOLD: usize = 1000;
+
+// According to "Little's law", assuming you can write 100MB per
+// second, and it takes about 100ms to process the write requests
+// on average, in that situation the writing bytes estimated 10MB,
+// here we use 100MB as default value for tolerate 1s latency.
+const DEFAULT_SCHED_PENDING_WRITE_MB: u64 = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -31,11 +37,12 @@ const DEFAULT_SCHED_TOO_BUSY_THRESHOLD: usize = 1000;
 pub struct Config {
     pub data_dir: String,
     pub gc_ratio_threshold: f64,
+    pub max_key_size: usize,
     pub scheduler_notify_capacity: usize,
     pub scheduler_messages_per_tick: usize,
     pub scheduler_concurrency: usize,
     pub scheduler_worker_pool_size: usize,
-    pub scheduler_too_busy_threshold: usize,
+    pub scheduler_pending_write_threshold: ReadableSize,
 }
 
 impl Default for Config {
@@ -44,11 +51,12 @@ impl Default for Config {
         Config {
             data_dir: DEFAULT_DATA_DIR.to_owned(),
             gc_ratio_threshold: DEFAULT_GC_RATIO_THRESHOLD,
+            max_key_size: DEFAULT_MAX_KEY_SIZE,
             scheduler_notify_capacity: DEFAULT_SCHED_CAPACITY,
             scheduler_messages_per_tick: DEFAULT_SCHED_MSG_PER_TICK,
             scheduler_concurrency: DEFAULT_SCHED_CONCURRENCY,
             scheduler_worker_pool_size: if total_cpu >= 16 { 8 } else { 4 },
-            scheduler_too_busy_threshold: DEFAULT_SCHED_TOO_BUSY_THRESHOLD,
+            scheduler_pending_write_threshold: ReadableSize::mb(DEFAULT_SCHED_PENDING_WRITE_MB),
         }
     }
 }
@@ -56,7 +64,7 @@ impl Default for Config {
 impl Config {
     pub fn validate(&mut self) -> Result<(), Box<Error>> {
         if self.data_dir != DEFAULT_DATA_DIR {
-            self.data_dir = try!(config::canonicalize_path(&self.data_dir))
+            self.data_dir = config::canonicalize_path(&self.data_dir)?
         }
         Ok(())
     }

@@ -56,17 +56,17 @@ lazy_static! {
             &["type"]
         ).unwrap();
 
+    pub static ref STORE_RAFT_DROPPED_MESSAGE_COUNTER_VEC: CounterVec =
+        register_counter_vec!(
+            "tikv_raftstore_raft_dropped_message_total",
+            "Total number of raft dropped messages.",
+            &["type"]
+        ).unwrap();
+
     pub static ref STORE_PD_HEARTBEAT_GAUGE_VEC: GaugeVec =
         register_gauge_vec!(
             "tikv_pd_heartbeat_tick_total",
             "Total number of pd heartbeat ticks.",
-            &["type"]
-        ).unwrap();
-
-    pub static ref STORE_SIZE_GAUGE_VEC: GaugeVec =
-        register_gauge_vec!(
-            "tikv_raftstore_store_size_bytes",
-            "Size of raftstore storage.",
             &["type"]
         ).unwrap();
 
@@ -113,20 +113,6 @@ lazy_static! {
             "Bucketed histogram of log lag in a region",
             vec![2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0,
                     512.0, 1024.0, 5120.0, 10240.0]
-        ).unwrap();
-
-    pub static ref REGION_WRITTEN_BYTES_HISTOGRAM: Histogram =
-        register_histogram!(
-            "tikv_region_written_bytes",
-            "Histogram of bytes written for regions",
-             exponential_buckets(256.0, 2.0, 20).unwrap()
-        ).unwrap();
-
-    pub static ref REGION_WRITTEN_KEYS_HISTOGRAM: Histogram =
-        register_histogram!(
-            "tikv_region_written_keys",
-            "Histogram of keys written for regions",
-             exponential_buckets(1.0, 2.0, 20).unwrap()
         ).unwrap();
 
     pub static ref REQUEST_WAIT_TIME_HISTOGRAM: Histogram =

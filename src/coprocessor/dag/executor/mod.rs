@@ -16,13 +16,13 @@ use std::rc::Rc;
 use util::codec::number::NumberDecoder;
 use tipb::expression::{Expr, ExprType};
 use tipb::schema::ColumnInfo;
-use util::collections::{HashMapEntry as Entry, HashSet};
+use util::collections::HashSet;
 
 use coprocessor::codec::mysql;
-use coprocessor::codec::datum::Datum;
+use coprocessor::codec::datum::{self, Datum};
 use coprocessor::codec::table::{RowColsDict, TableDecoder};
 use coprocessor::endpoint::get_pk;
-use coprocessor::select::xeval::{EvalContext, Evaluator};
+use coprocessor::select::xeval::EvalContext;
 use coprocessor::{Error, Result};
 
 mod scanner;
@@ -66,7 +66,7 @@ impl ExprColumnRefVisitor {
             self.cols_offset.insert(offset);
         } else {
             for sub_expr in expr.get_children() {
-                try!(self.visit(sub_expr));
+                self.visit(sub_expr)?;
             }
         }
         Ok(())
@@ -74,7 +74,7 @@ impl ExprColumnRefVisitor {
 
     pub fn batch_visit(&mut self, exprs: &[Expr]) -> Result<()> {
         for expr in exprs {
-            try!(self.visit(expr));
+            self.visit(expr)?;
         }
         Ok(())
     }
@@ -97,6 +97,30 @@ impl Row {
             data: data,
         }
     }
+
+    // get binary of each column in order of columns
+    pub fn get_binary_cols(&self, columns: &[ColumnInfo]) -> Result<Vec<Vec<u8>>> {
+        let mut res = Vec::with_capacity(columns.len());
+        for col in columns {
+            if col.get_pk_handle() {
+                let v = get_pk(col, self.handle);
+                let bt = box_try!(datum::encode_value(&[v]));
+                res.push(bt);
+                continue;
+            }
+            let col_id = col.get_column_id();
+            let value = match self.data.get(col_id) {
+                None if col.has_default_val() => col.get_default_val().to_vec(),
+                None if mysql::has_not_null_flag(col.get_flag() as u64) => {
+                    return Err(box_err!("column {} of {} is missing", col_id, self.handle));
+                }
+                None => box_try!(datum::encode_value(&[Datum::Null])),
+                Some(bs) => bs.to_vec(),
+            };
+            res.push(value);
+        }
+        Ok(res)
+    }
 }
 
 pub trait Executor {
@@ -104,35 +128,33 @@ pub trait Executor {
 }
 
 pub fn inflate_with_col_for_dag(
-    eval: &mut Evaluator,
     ctx: &EvalContext,
     values: &RowColsDict,
     columns: Rc<Vec<ColumnInfo>>,
     offsets: &[usize],
     h: i64,
-) -> Result<()> {
+) -> Result<Vec<Datum>> {
+    let mut res = vec![Datum::Null; columns.len()];
     for offset in offsets {
         let col = columns.get(*offset).unwrap();
-        if let Entry::Vacant(e) = eval.row.entry(*offset as i64) {
-            if col.get_pk_handle() {
-                let v = get_pk(col, h);
-                e.insert(v);
-            } else {
-                let col_id = col.get_column_id();
-                let value = match values.get(col_id) {
-                    None if col.has_default_val() => {
-                        // TODO: optimize it to decode default value only once.
-                        box_try!(col.get_default_val().decode_col_value(ctx, col))
-                    }
-                    None if mysql::has_not_null_flag(col.get_flag() as u64) => {
-                        return Err(box_err!("column {} of {} is missing", col_id, h));
-                    }
-                    None => Datum::Null,
-                    Some(mut bs) => box_try!(bs.decode_col_value(ctx, col)),
-                };
-                e.insert(value);
-            }
+        if col.get_pk_handle() {
+            let v = get_pk(col, h);
+            res[*offset] = v;
+        } else {
+            let col_id = col.get_column_id();
+            let value = match values.get(col_id) {
+                None if col.has_default_val() => {
+                    // TODO: optimize it to decode default value only once.
+                    box_try!(col.get_default_val().decode_col_value(ctx, col))
+                }
+                None if mysql::has_not_null_flag(col.get_flag() as u64) => {
+                    return Err(box_err!("column {} of {} is missing", col_id, h));
+                }
+                None => Datum::Null,
+                Some(mut bs) => box_try!(bs.decode_col_value(ctx, col)),
+            };
+            res[*offset] = value;
         }
     }
-    Ok(())
+    Ok(res)
 }

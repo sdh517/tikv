@@ -10,8 +10,6 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // See the License for the specific language governing permissions and
 // limitations under the License.
-// FIXME(shirly): remove following later
-#![allow(dead_code, unused_variables)]
 
 mod column;
 mod constant;
@@ -219,7 +217,7 @@ impl Expression {
             };
             return s.map(Some);
         }
-        Err(box_err!("unsupported codec"))
+        Err(box_err!("unsupported charset: {}", chrst))
     }
 
     fn eval_time<'a, 'b: 'a>(
@@ -278,13 +276,6 @@ impl Expression {
     }
 }
 
-fn filter<T: Into<Datum>>(x: Result<T>) -> Option<Result<Datum>> {
-    match x {
-        Err(Error::UnknownSignature(_)) => None,
-        e => Some(e.map(|x| x.into())),
-    }
-}
-
 impl Expression {
     pub fn eval(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Datum> {
         match *self {
@@ -294,7 +285,16 @@ impl Expression {
         }
     }
 
-    pub fn build(mut expr: Expr, ctx: &StatementContext) -> Result<Self> {
+    pub fn batch_build(ctx: &StatementContext, exprs: Vec<Expr>) -> Result<Vec<Self>> {
+        let mut data = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            let ex = Expression::build(ctx, expr)?;
+            data.push(ex);
+        }
+        Ok(data)
+    }
+
+    pub fn build(ctx: &StatementContext, mut expr: Expr) -> Result<Self> {
         let tp = expr.take_field_type();
         match expr.get_tp() {
             ExprType::Null => Ok(Expression::new_const(Datum::Null, tp)),
@@ -342,13 +342,10 @@ impl Expression {
                 .map(|e| Expression::new_const(e, tp))
                 .map_err(Error::from),
             ExprType::ScalarFunc => {
-                try!(FnCall::check_args(
-                    expr.get_sig(),
-                    expr.get_children().len()
-                ));
+                FnCall::check_args(expr.get_sig(), expr.get_children().len())?;
                 expr.take_children()
                     .into_iter()
-                    .map(|child| Expression::build(child, ctx))
+                    .map(|child| Expression::build(ctx, child))
                     .collect::<Result<Vec<_>>>()
                     .map(|children| {
                         Expression::ScalarFn(FnCall {
@@ -359,14 +356,14 @@ impl Expression {
                     })
             }
             ExprType::ColumnRef => {
-                let offset = try!(expr.get_val().decode_i64().map_err(Error::from)) as usize;
+                let offset = expr.get_val().decode_i64().map_err(Error::from)? as usize;
                 let column = Column {
                     offset: offset,
                     tp: tp,
                 };
                 Ok(Expression::ColumnRef(column))
             }
-            unhandled => unreachable!("can't handle {:?} expr in DAG mode", unhandled),
+            unhandled => Err(box_err!("can't handle {:?} expr in DAG mode", unhandled)),
         }
     }
 }
@@ -452,7 +449,7 @@ mod test {
                 .set_decimal(convert::UNSPECIFIED_LENGTH as i32);
             ex.mut_field_type()
                 .set_flen(convert::UNSPECIFIED_LENGTH as i32);
-            let e = Expression::build(ex, &ctx).unwrap();
+            let e = Expression::build(&ctx, ex).unwrap();
             let res = e.eval(&ctx, &cols).unwrap();
             if let Datum::F64(_) = exp {
                 assert_eq!(format!("{}", res), format!("{}", exp));
@@ -476,7 +473,7 @@ mod test {
             if flag.is_some() {
                 ex.mut_field_type().set_flag(flag.unwrap() as u32);
             }
-            let e = Expression::build(ex, &ctx).unwrap();
+            let e = Expression::build(&ctx, ex).unwrap();
             let res = e.eval(&ctx, &cols).unwrap();
             assert_eq!(res, exp);
         }

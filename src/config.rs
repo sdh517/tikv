@@ -21,6 +21,7 @@ use rocksdb::{BlockBasedOptions, ColumnFamilyOptions, CompactionPriority, DBComp
 use sys_info;
 
 use server::Config as ServerConfig;
+use raftstore::coprocessor::Config as CopConfig;
 use raftstore::store::Config as RaftstoreConfig;
 use raftstore::store::keys::region_raft_prefix_len;
 use storage::{Config as StorageConfig, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, DEFAULT_DATA_DIR,
@@ -37,14 +38,14 @@ const RAFT_MAX_MEM: usize = 2 * GB as usize;
 
 fn memory_mb_for_cf(is_raft_db: bool, cf: &str) -> usize {
     let total_mem = sys_info::mem_info().unwrap().total * KB;
-    let (radio, min, max) = match (is_raft_db, cf) {
+    let (ratio, min, max) = match (is_raft_db, cf) {
         (true, CF_DEFAULT) => (0.02, RAFT_MIN_MEM, RAFT_MAX_MEM),
         (false, CF_DEFAULT) => (0.25, 0, usize::MAX),
         (false, CF_LOCK) => (0.02, LOCKCF_MIN_MEM, LOCKCF_MAX_MEM),
         (false, CF_WRITE) => (0.15, 0, usize::MAX),
         _ => unreachable!(),
     };
-    let mut size = (total_mem as f64 * radio) as usize;
+    let mut size = (total_mem as f64 * ratio) as usize;
     if size < min {
         size = min;
     } else if size > max {
@@ -62,10 +63,12 @@ macro_rules! cf_config {
             pub block_size: ReadableSize,
             pub block_cache_size: ReadableSize,
             pub cache_index_and_filter_blocks: bool,
+            pub pin_l0_filter_and_index_blocks: bool,
             pub use_bloom_filter: bool,
             pub whole_key_filtering: bool,
             pub bloom_filter_bits_per_key: i32,
             pub block_based_bloom_filter: bool,
+            pub read_amp_bytes_per_bit: u32,
             #[serde(with = "compression_type_level_serde")]
             pub compression_per_level: [DBCompressionType; 7],
             pub write_buffer_size: ReadableSize,
@@ -87,13 +90,16 @@ macro_rules! build_cf_opt {
     ($opt:ident) => {{
         let mut block_base_opts = BlockBasedOptions::new();
         block_base_opts.set_block_size($opt.block_size.0 as usize);
-        block_base_opts.set_lru_cache($opt.block_cache_size.0 as usize);
+        block_base_opts.set_lru_cache($opt.block_cache_size.0 as usize, -1, 0, 0.0);
         block_base_opts.set_cache_index_and_filter_blocks($opt.cache_index_and_filter_blocks);
+        block_base_opts.set_pin_l0_filter_and_index_blocks_in_cache(
+            $opt.pin_l0_filter_and_index_blocks);
         if $opt.use_bloom_filter {
             block_base_opts.set_bloom_filter($opt.bloom_filter_bits_per_key,
                                              $opt.block_based_bloom_filter);
             block_base_opts.set_whole_key_filtering($opt.whole_key_filtering);
         }
+        block_base_opts.set_read_amp_bytes_per_bit($opt.read_amp_bytes_per_bit);
         let mut cf_opts = ColumnFamilyOptions::new();
         cf_opts.set_block_based_table_factory(&block_base_opts);
         cf_opts.compression_per_level(&$opt.compression_per_level);
@@ -119,10 +125,12 @@ impl Default for DefaultCfConfig {
             block_size: ReadableSize::kb(64),
             block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_DEFAULT) as u64),
             cache_index_and_filter_blocks: true,
+            pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: true,
             whole_key_filtering: true,
             bloom_filter_bits_per_key: 10,
             block_based_bloom_filter: false,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [
                 DBCompressionType::No,
                 DBCompressionType::No,
@@ -163,10 +171,12 @@ impl Default for WriteCfConfig {
             block_size: ReadableSize::kb(64),
             block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_WRITE) as u64),
             cache_index_and_filter_blocks: true,
+            pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: true,
             whole_key_filtering: false,
             bloom_filter_bits_per_key: 10,
             block_based_bloom_filter: false,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [
                 DBCompressionType::No,
                 DBCompressionType::No,
@@ -217,10 +227,12 @@ impl Default for LockCfConfig {
             block_size: ReadableSize::kb(16),
             block_cache_size: ReadableSize::mb(memory_mb_for_cf(false, CF_LOCK) as u64),
             cache_index_and_filter_blocks: true,
+            pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: true,
             whole_key_filtering: true,
             bloom_filter_bits_per_key: 10,
             block_based_bloom_filter: false,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [DBCompressionType::No; 7],
             write_buffer_size: ReadableSize::mb(128),
             max_write_buffer_number: 5,
@@ -256,10 +268,12 @@ impl Default for RaftCfConfig {
             block_size: ReadableSize::kb(16),
             block_cache_size: ReadableSize::mb(128),
             cache_index_and_filter_blocks: true,
+            pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: true,
             whole_key_filtering: true,
             bloom_filter_bits_per_key: 10,
             block_based_bloom_filter: false,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [DBCompressionType::No; 7],
             write_buffer_size: ReadableSize::mb(128),
             max_write_buffer_number: 5,
@@ -308,6 +322,7 @@ pub struct DbConfig {
     pub info_log_roll_time: ReadableDuration,
     pub info_log_dir: String,
     pub rate_bytes_per_sec: ReadableSize,
+    pub wal_bytes_per_sync: ReadableSize,
     pub max_sub_compactions: u32,
     pub writable_file_max_buffer_size: ReadableSize,
     pub use_direct_io_for_flush_and_compaction: bool,
@@ -338,6 +353,7 @@ impl Default for DbConfig {
             info_log_roll_time: ReadableDuration::secs(0),
             info_log_dir: "".to_owned(),
             rate_bytes_per_sec: ReadableSize::kb(0),
+            wal_bytes_per_sync: ReadableSize::kb(0),
             max_sub_compactions: 1,
             writable_file_max_buffer_size: ReadableSize::mb(1),
             use_direct_io_for_flush_and_compaction: false,
@@ -386,6 +402,7 @@ impl DbConfig {
         if self.rate_bytes_per_sec.0 > 0 {
             opts.set_ratelimiter(self.rate_bytes_per_sec.0 as i64);
         }
+        opts.set_wal_bytes_per_sync(self.wal_bytes_per_sync.0 as u64);
         opts.set_max_subcompactions(self.max_sub_compactions);
         opts.set_writable_file_max_buffer_size(self.writable_file_max_buffer_size.0 as i32);
         opts.set_use_direct_io_for_flush_and_compaction(
@@ -407,7 +424,7 @@ impl DbConfig {
 
     fn validate(&mut self) -> Result<(), Box<Error>> {
         if !self.backup_dir.is_empty() {
-            self.backup_dir = try!(config::canonicalize_path(&self.backup_dir));
+            self.backup_dir = config::canonicalize_path(&self.backup_dir)?;
         }
         Ok(())
     }
@@ -421,10 +438,12 @@ impl Default for RaftDefaultCfConfig {
             block_size: ReadableSize::kb(64),
             block_cache_size: ReadableSize::mb(memory_mb_for_cf(true, CF_DEFAULT) as u64),
             cache_index_and_filter_blocks: true,
+            pin_l0_filter_and_index_blocks: true,
             use_bloom_filter: false,
             whole_key_filtering: true,
             bloom_filter_bits_per_key: 10,
             block_based_bloom_filter: false,
+            read_amp_bytes_per_bit: 0,
             compression_per_level: [
                 DBCompressionType::No,
                 DBCompressionType::No,
@@ -487,6 +506,7 @@ pub struct RaftDbConfig {
     pub use_direct_io_for_flush_and_compaction: bool,
     pub enable_pipelined_write: bool,
     pub allow_concurrent_memtable_write: bool,
+    pub wal_bytes_per_sync: ReadableSize,
     pub defaultcf: RaftDefaultCfConfig,
 }
 
@@ -512,6 +532,7 @@ impl Default for RaftDbConfig {
             use_direct_io_for_flush_and_compaction: false,
             enable_pipelined_write: true,
             allow_concurrent_memtable_write: false,
+            wal_bytes_per_sync: ReadableSize::kb(0),
             defaultcf: RaftDefaultCfConfig::default(),
         }
     }
@@ -556,6 +577,8 @@ impl RaftDbConfig {
         opts.enable_pipelined_write(self.enable_pipelined_write);
         opts.allow_concurrent_memtable_write(self.allow_concurrent_memtable_write);
         opts.add_event_listener(EventListener::new("raft"));
+        opts.set_wal_bytes_per_sync(self.wal_bytes_per_sync.0 as u64);
+
         opts
     }
 
@@ -577,7 +600,7 @@ impl PdConfig {
             return Err("please specify pd.endpoints.".into());
         }
         for addr in &self.endpoints {
-            try!(config::check_addr(addr));
+            config::check_addr(addr)?;
         }
         Ok(())
     }
@@ -627,6 +650,7 @@ pub struct TiKvConfig {
     pub metric: MetricConfig,
     #[serde(rename = "raftstore")]
     pub raft_store: RaftstoreConfig,
+    pub coprocessor: CopConfig,
     pub rocksdb: DbConfig,
     pub raftdb: RaftDbConfig,
 }
@@ -639,6 +663,7 @@ impl Default for TiKvConfig {
             server: ServerConfig::default(),
             metric: MetricConfig::default(),
             raft_store: RaftstoreConfig::default(),
+            coprocessor: CopConfig::default(),
             pd: PdConfig::default(),
             rocksdb: DbConfig::default(),
             raftdb: RaftDbConfig::default(),
@@ -649,7 +674,7 @@ impl Default for TiKvConfig {
 
 impl TiKvConfig {
     pub fn validate(&mut self) -> Result<(), Box<Error>> {
-        try!(self.storage.validate());
+        self.storage.validate()?;
         if self.rocksdb.backup_dir.is_empty() && self.storage.data_dir != DEFAULT_DATA_DIR {
             self.rocksdb.backup_dir = format!(
                 "{}",
@@ -657,19 +682,15 @@ impl TiKvConfig {
             );
         }
 
+        self.raft_store.region_split_check_diff = self.coprocessor.region_split_size / 16;
         self.raft_store.raftdb_path = if self.raft_store.raftdb_path.is_empty() {
-            try!(config::canonicalize_sub_path(
-                &self.storage.data_dir,
-                "raft"
-            ))
+            config::canonicalize_sub_path(&self.storage.data_dir, "raft")?
         } else {
-            try!(config::canonicalize_path(&self.raft_store.raftdb_path))
+            config::canonicalize_path(&self.raft_store.raftdb_path)?
         };
 
-        let kv_db_path = try!(config::canonicalize_sub_path(
-            &self.storage.data_dir,
-            DEFAULT_ROCKSDB_SUB_DIR
-        ));
+        let kv_db_path =
+            config::canonicalize_sub_path(&self.storage.data_dir, DEFAULT_ROCKSDB_SUB_DIR)?;
 
         if kv_db_path == self.raft_store.raftdb_path {
             return Err(
@@ -683,10 +704,44 @@ impl TiKvConfig {
             return Err("default rocksdb not exist, buf raftdb exist".into());
         }
 
-        try!(self.rocksdb.validate());
-        try!(self.server.validate());
-        try!(self.raft_store.validate());
-        try!(self.pd.validate());
+        self.rocksdb.validate()?;
+        self.server.validate()?;
+        self.raft_store.validate()?;
+        self.pd.validate()?;
+        self.coprocessor.validate()?;
         Ok(())
+    }
+
+    pub fn compatible_adjust(&mut self) {
+        let default_raft_store = RaftstoreConfig::default();
+        let default_coprocessor = CopConfig::default();
+        if self.raft_store.region_max_size != default_raft_store.region_max_size {
+            warn!(
+                "deprecated configuration, \
+                 raftstore.region-max-size has been moved to coprocessor"
+            );
+            if self.coprocessor.region_max_size == default_coprocessor.region_max_size {
+                warn!(
+                    "override coprocessor.region-max-size with raftstore.region-max-size, {:?}",
+                    self.raft_store.region_max_size
+                );
+                self.coprocessor.region_max_size = self.raft_store.region_max_size;
+            }
+            self.raft_store.region_max_size = default_raft_store.region_max_size;
+        }
+        if self.raft_store.region_split_size != default_raft_store.region_split_size {
+            warn!(
+                "deprecated configuration, \
+                 raftstore.region-split-size has been moved to coprocessor",
+            );
+            if self.coprocessor.region_split_size == default_coprocessor.region_split_size {
+                warn!(
+                    "override coprocessor.region-split-size with raftstore.region-split-size, {:?}",
+                    self.raft_store.region_split_size
+                );
+                self.coprocessor.region_split_size = self.raft_store.region_split_size;
+            }
+            self.raft_store.region_split_size = default_raft_store.region_split_size;
+        }
     }
 }

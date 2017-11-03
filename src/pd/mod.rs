@@ -11,22 +11,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::BoxFuture;
 
 mod metrics;
 mod client;
 mod util;
 
 pub mod errors;
+pub mod pd;
 pub use self::errors::{Error, Result};
 pub use self::client::RpcClient;
 pub use self::util::validate_endpoints;
+pub use self::pd::{Runner as PdRunner, Task as PdTask};
 
 use kvproto::metapb;
 use kvproto::pdpb;
+use futures::Future;
 
 pub type Key = Vec<u8>;
-pub type PdFuture<T> = BoxFuture<T, Error>;
+pub type PdFuture<T> = Box<Future<Item = T, Error = Error> + Send>;
 
 #[derive(Default)]
 pub struct RegionStat {
@@ -34,6 +36,8 @@ pub struct RegionStat {
     pub pending_peers: Vec<metapb::Peer>,
     pub written_bytes: u64,
     pub written_keys: u64,
+    pub read_bytes: u64,
+    pub read_keys: u64,
     pub approximate_size: u64,
 }
 
@@ -43,6 +47,8 @@ impl RegionStat {
         pending_peers: Vec<metapb::Peer>,
         written_bytes: u64,
         written_keys: u64,
+        read_bytes: u64,
+        read_keys: u64,
         approximate_size: u64,
     ) -> RegionStat {
         RegionStat {
@@ -50,6 +56,8 @@ impl RegionStat {
             pending_peers: pending_peers,
             written_bytes: written_bytes,
             written_keys: written_keys,
+            read_bytes: read_bytes,
+            read_keys: read_keys,
             approximate_size: approximate_size,
         }
     }

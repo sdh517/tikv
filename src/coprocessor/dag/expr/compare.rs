@@ -11,8 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{char, str, i64};
-use std::str::Chars;
+use std::{str, i64};
+use std::slice::Iter;
 use std::cmp::Ordering;
 use std::borrow::Cow;
 
@@ -20,6 +20,8 @@ use coprocessor::codec::{datum, mysql, Datum};
 use coprocessor::codec::mysql::{Decimal, Duration, Json, Time};
 use coprocessor::dag::expr::Expression;
 use super::{Error, FnCall, Result, StatementContext};
+
+const MAX_RECURSE_LEVEL: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum CmpOp {
@@ -159,15 +161,60 @@ impl FnCall {
         do_coalesce(self, |v| v.eval_json(ctx, row))
     }
 
-    #[inline]
+    pub fn in_int(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+        do_in(
+            self,
+            |v| v.eval_int(ctx, row),
+            |l, r| {
+                let lhs_unsigned = mysql::has_unsigned_flag(self.children[0].get_tp().get_flag());
+                let rhs_unsigned = mysql::has_unsigned_flag(self.children[1].get_tp().get_flag());
+                Ok(cmp_i64_with_unsigned_flag(
+                    *l,
+                    lhs_unsigned,
+                    *r,
+                    rhs_unsigned,
+                ))
+            },
+        )
+    }
+
+    pub fn in_real(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+        do_in(
+            self,
+            |v| v.eval_real(ctx, row),
+            |l, r| datum::cmp_f64(*l, *r).map_err(Error::from),
+        )
+    }
+
+    pub fn in_decimal(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+        do_in(self, |v| v.eval_decimal(ctx, row), |l, r| Ok(l.cmp(r)))
+    }
+
+    pub fn in_time(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+        do_in(self, |v| v.eval_time(ctx, row), |l, r| Ok(l.cmp(r)))
+    }
+
+    pub fn in_duration(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+        do_in(self, |v| v.eval_duration(ctx, row), |l, r| Ok(l.cmp(r)))
+    }
+
+    pub fn in_string(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+        do_in(self, |v| v.eval_string(ctx, row), |l, r| Ok(l.cmp(r)))
+    }
+
+    pub fn in_json(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
+        do_in(self, |v| v.eval_json(ctx, row), |l, r| Ok(l.cmp(r)))
+    }
+
+    /// NOTE: LIKE compare target with pattern as bytes, even if they have different
+    /// charsets. This behaviour is for keeping compatible with TiDB. But MySQL
+    /// compare them as bytes only if any charset of pattern or target is binary,
+    /// otherwise MySQL will compare decoded string.
     pub fn like(&self, ctx: &StatementContext, row: &[Datum]) -> Result<Option<i64>> {
-        let target = try_opt!(self.children[0].eval_string_and_decode(ctx, row));
-        let pattern = try_opt!(self.children[1].eval_string_and_decode(ctx, row));
-        let escape = {
-            let c = try_opt!(self.children[2].eval_int(ctx, row)) as u32;
-            try!(char::from_u32(c).ok_or::<Error>(box_err!("invalid escape char: {}", c)))
-        };
-        Ok(Some(like_match(&target, &pattern, escape) as i64))
+        let target = try_opt!(self.children[0].eval_string(ctx, row));
+        let pattern = try_opt!(self.children[1].eval_string(ctx, row));
+        let escape = try_opt!(self.children[2].eval_int(ctx, row)) as u32;
+        Ok(Some(like(&target, &pattern, escape, 0)? as i64))
     }
 }
 
@@ -176,15 +223,15 @@ where
     E: Fn(usize) -> Result<Option<T>>,
     F: Fn(T, T) -> Result<Ordering>,
 {
-    let lhs = try!(e(0));
+    let lhs = e(0)?;
     if lhs.is_none() && op != CmpOp::NullEQ {
         return Ok(None);
     }
-    let rhs = try!(e(1));
+    let rhs = e(1)?;
     match (lhs, rhs) {
         (None, None) => Ok(Some(1)),
         (Some(lhs), Some(rhs)) => {
-            let ordering = try!(get_order(lhs, rhs));
+            let ordering = get_order(lhs, rhs)?;
             let r = match op {
                 CmpOp::LT => ordering == Ordering::Less,
                 CmpOp::LE => ordering != Ordering::Greater,
@@ -234,7 +281,7 @@ where
     F: Fn(&'a Expression) -> Result<Option<T>>,
 {
     for exp in &expr.children {
-        let v = try!(f(exp));
+        let v = f(exp)?;
         if v.is_some() {
             return Ok(v);
         }
@@ -242,36 +289,95 @@ where
     Ok(None)
 }
 
-#[inline]
-fn next_escaped(chars: &mut Chars, escape: char) -> Option<(char, bool)> {
-    chars.next().map(|c| if c == escape {
-        chars.next().map_or((c, false), |c| (c, true))
-    } else {
-        (c, false)
-    })
-}
-
-/// Document is [here](https://dev.mysql.com/doc/refman/5.7/en/string-comparison-functions.html)
-fn like_match(target: &str, pattern: &str, escape: char) -> bool {
-    let (mut tcs, mut pcs) = (target.chars(), pattern.chars());
-    while let Some((c, escaped)) = next_escaped(&mut pcs, escape) {
-        if c == '%' && (!escaped || escape == '%') {
-            while !like_match(tcs.as_str(), pcs.as_str(), escape) {
-                if tcs.next().is_none() {
-                    return false;
-                }
-            }
-            return true;
-        } else {
-            if let Some(t) = tcs.next() {
-                if t == c || (c == '_' && (!escaped || escape == '%')) {
-                    continue;
-                }
-            }
-            return false;
+fn do_in<'a, T, E, F>(expr: &'a FnCall, f: F, get_order: E) -> Result<Option<i64>>
+where
+    F: Fn(&'a Expression) -> Result<Option<T>>,
+    E: Fn(&T, &T) -> Result<Ordering>,
+{
+    let (first, others) = expr.children.split_first().unwrap();
+    let arg = try_opt!(f(first));
+    let mut ret_when_not_matched = Ok(Some(0));
+    for exp in others {
+        let arg1 = f(exp)?;
+        if arg1.is_none() {
+            ret_when_not_matched = Ok(None);
+            continue;
+        }
+        let cmp_result = get_order(&arg, &arg1.unwrap())?;
+        if cmp_result == Ordering::Equal {
+            return Ok(Some(1));
         }
     }
-    tcs.next().is_none()
+    ret_when_not_matched
+}
+
+// Do match until '%' is found.
+#[inline]
+fn partial_like(tcs: &mut Iter<u8>, pcs: &mut Iter<u8>, escape: u32) -> Option<bool> {
+    loop {
+        match pcs.next().cloned() {
+            None => return Some(tcs.next().is_none()),
+            Some(b'%') => return None,
+            Some(c) => {
+                let (npc, escape) = if c as u32 == escape {
+                    pcs.next().map_or((c, false), |&c| (c, true))
+                } else {
+                    (c, false)
+                };
+                let nsc = match tcs.next() {
+                    None => return Some(false),
+                    Some(&c) => c,
+                };
+                if nsc != npc && (npc != b'_' || escape) {
+                    return Some(false);
+                }
+            }
+        }
+    }
+}
+
+fn like(target: &[u8], pattern: &[u8], escape: u32, recurse_level: usize) -> Result<bool> {
+    let mut tcs = target.iter();
+    let mut pcs = pattern.iter();
+    loop {
+        if let Some(res) = partial_like(&mut tcs, &mut pcs, escape) {
+            return Ok(res);
+        }
+        let next_char = loop {
+            match pcs.next().cloned() {
+                Some(b'%') => {}
+                Some(b'_') => if tcs.next().is_none() {
+                    return Ok(false);
+                },
+                // So the pattern should be some thing like 'xxx%'
+                None => return Ok(true),
+                Some(c) => {
+                    break if c as u32 == escape {
+                        pcs.next().map_or(escape, |&c| c as u32)
+                    } else {
+                        c as u32
+                    };
+                }
+            }
+        };
+        if recurse_level >= MAX_RECURSE_LEVEL {
+            // TODO: maybe we should test if stack is actually about to overflow.
+            return Err(box_err!(
+                "recurse level should not be larger than {}",
+                MAX_RECURSE_LEVEL
+            ));
+        }
+        // Pattern must be something like "%xxx".
+        loop {
+            let s = match tcs.next() {
+                None => return Ok(false),
+                Some(&s) => s as u32,
+            };
+            if s == next_char && like(tcs.as_slice(), pcs.as_slice(), escape, recurse_level + 1)? {
+                return Ok(true);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -382,7 +488,142 @@ mod test {
             expr.set_sig(sig);
 
             expr.set_children(RepeatedField::from_vec(children));
-            let e = Expression::build(expr, &ctx).unwrap();
+            let e = Expression::build(&ctx, expr).unwrap();
+            let res = e.eval(&ctx, &row).unwrap();
+            assert_eq!(res, exp);
+        }
+    }
+
+    #[test]
+    fn test_in() {
+        let dec1 = "1.1".parse::<Decimal>().unwrap();
+        let dec2 = "1.11".parse::<Decimal>().unwrap();
+        let dur1 = Duration::parse(b"01:00:00", 0).unwrap();
+        let dur2 = Duration::parse(b"02:00:00", 0).unwrap();
+        let json1 = Json::I64(11);
+        let json2 = Json::I64(12);
+        let s1 = "你好".as_bytes().to_owned();
+        let s2 = "你好啊".as_bytes().to_owned();
+        let t1 = Time::parse_utc_datetime("2012-12-12 12:00:39", 0).unwrap();
+        let t2 = Time::parse_utc_datetime("2012-12-12 13:00:39", 0).unwrap();
+        let cases = vec![
+            (
+                ScalarFuncSig::InInt,
+                vec![Datum::I64(1), Datum::I64(2)],
+                Datum::I64(0),
+            ),
+            (
+                ScalarFuncSig::InInt,
+                vec![Datum::I64(1), Datum::I64(2), Datum::I64(1)],
+                Datum::I64(1),
+            ),
+            (
+                ScalarFuncSig::InInt,
+                vec![Datum::I64(1), Datum::I64(2), Datum::Null],
+                Datum::Null,
+            ),
+            (
+                ScalarFuncSig::InInt,
+                vec![Datum::I64(1), Datum::I64(2), Datum::Null, Datum::I64(1)],
+                Datum::I64(1),
+            ),
+            (
+                ScalarFuncSig::InInt,
+                vec![Datum::Null, Datum::I64(2), Datum::I64(1)],
+                Datum::Null,
+            ),
+            (
+                ScalarFuncSig::InReal,
+                vec![Datum::F64(3.1), Datum::F64(3.2), Datum::F64(3.3)],
+                Datum::I64(0),
+            ),
+            (
+                ScalarFuncSig::InReal,
+                vec![Datum::F64(3.1), Datum::F64(3.2), Datum::F64(3.1)],
+                Datum::I64(1),
+            ),
+            (
+                ScalarFuncSig::InDecimal,
+                vec![Datum::Dec(dec1.clone()), Datum::Dec(dec2.clone())],
+                Datum::I64(0),
+            ),
+            (
+                ScalarFuncSig::InDecimal,
+                vec![
+                    Datum::Dec(dec1.clone()),
+                    Datum::Dec(dec2.clone()),
+                    Datum::Dec(dec1.clone()),
+                ],
+                Datum::I64(1),
+            ),
+            (
+                ScalarFuncSig::InDuration,
+                vec![Datum::Dur(dur1.clone()), Datum::Dur(dur2.clone())],
+                Datum::I64(0),
+            ),
+            (
+                ScalarFuncSig::InDuration,
+                vec![
+                    Datum::Dur(dur1.clone()),
+                    Datum::Dur(dur2.clone()),
+                    Datum::Dur(dur1.clone()),
+                ],
+                Datum::I64(1),
+            ),
+            (
+                ScalarFuncSig::InJson,
+                vec![Datum::Json(json1.clone()), Datum::Json(json2.clone())],
+                Datum::I64(0),
+            ),
+            (
+                ScalarFuncSig::InJson,
+                vec![
+                    Datum::Json(json1.clone()),
+                    Datum::Json(json2.clone()),
+                    Datum::Json(json1.clone()),
+                ],
+                Datum::I64(1),
+            ),
+            (
+                ScalarFuncSig::InString,
+                vec![Datum::Bytes(s1.clone()), Datum::Bytes(s2.clone())],
+                Datum::I64(0),
+            ),
+            (
+                ScalarFuncSig::InString,
+                vec![
+                    Datum::Bytes(s1.clone()),
+                    Datum::Bytes(s2.clone()),
+                    Datum::Bytes(s1.clone()),
+                ],
+                Datum::I64(1),
+            ),
+            (
+                ScalarFuncSig::InTime,
+                vec![Datum::Time(t1.clone()), Datum::Time(t2.clone())],
+                Datum::I64(0),
+            ),
+            (
+                ScalarFuncSig::InTime,
+                vec![
+                    Datum::Time(t1.clone()),
+                    Datum::Time(t2.clone()),
+                    Datum::Time(t1.clone()),
+                ],
+                Datum::I64(1),
+            ),
+        ];
+
+        let ctx = StatementContext::default();
+
+        for (sig, row, exp) in cases {
+            let children: Vec<Expr> = (0..row.len()).map(|id| col_expr(id as i64)).collect();
+            let mut expr = Expr::new();
+            expr.set_tp(ExprType::ScalarFunc);
+            expr.set_sig(sig);
+
+            expr.set_children(RepeatedField::from_vec(children));
+            let e = Expression::build(&ctx, expr).unwrap();
             let res = e.eval(&ctx, &row).unwrap();
             assert_eq!(res, exp);
         }
@@ -395,6 +636,13 @@ mod test {
             (r#"Hello, World"#, r#"Hello, World"#, '\\', true),
             (r#"Hello, World"#, r#"Hello, %"#, '\\', true),
             (r#"Hello, World"#, r#"%, World"#, '\\', true),
+            (r#"test"#, r#"te%st"#, '\\', true),
+            (r#"test"#, r#"te%%st"#, '\\', true),
+            (r#"test"#, r#"test%"#, '\\', true),
+            (r#"test"#, r#"%test%"#, '\\', true),
+            (r#"test"#, r#"t%e%s%t"#, '\\', true),
+            (r#"test"#, r#"_%_%_%_"#, '\\', true),
+            (r#"test"#, r#"_%_%st"#, '\\', true),
             (r#"C:"#, r#"%\"#, '\\', false),
             (r#"C:\"#, r#"%\"#, '\\', true),
             (r#"C:\Programs"#, r#"%\"#, '\\', false),
@@ -416,15 +664,15 @@ mod test {
             (r#"3hello"#, r#"%_hello"#, '%', true),
         ];
         let ctx = StatementContext::default();
-        for (target, pattern, escape, exp) in cases {
-            let target = datum_expr(Datum::Bytes(target.as_bytes().to_vec()));
-            let pattern = datum_expr(Datum::Bytes(pattern.as_bytes().to_vec()));
+        for (target_str, pattern_str, escape, exp) in cases {
+            let target = datum_expr(Datum::Bytes(target_str.as_bytes().to_vec()));
+            let pattern = datum_expr(Datum::Bytes(pattern_str.as_bytes().to_vec()));
             let escape = datum_expr(Datum::I64(escape as i64));
             let op = fncall_expr(ScalarFuncSig::LikeSig, &[target, pattern, escape]);
-            let op = Expression::build(op, &ctx).unwrap();
+            let op = Expression::build(&ctx, op).unwrap();
             let got = op.eval(&ctx, &[]).unwrap();
             let exp = Datum::from(exp);
-            assert_eq!(got, exp);
+            assert_eq!(got, exp, "{:?} like {:?}", target_str, pattern_str);
         }
     }
 }

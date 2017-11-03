@@ -29,8 +29,9 @@ use tikv::server::transport::ServerRaftStoreRouter;
 use tikv::server::transport::RaftStoreRouter;
 use tikv::raftstore::{store, Error, Result};
 use tikv::raftstore::store::{Engines, Msg as StoreMsg, SnapManager};
+use tikv::raftstore::coprocessor::CoprocessorHost;
 use tikv::util::transport::SendCh;
-use tikv::util::worker::Worker;
+use tikv::util::worker::{FutureWorker, Worker};
 use tikv::storage::{CfName, Engine};
 use kvproto::raft_serverpb::{self, RaftMessage};
 use kvproto::raft_cmdpb::*;
@@ -79,6 +80,10 @@ impl ServerCluster {
             raft_client: RaftClient::new(env, Config::default()),
         }
     }
+
+    pub fn get_addr(&self, node_id: u64) -> SocketAddr {
+        self.addrs[&node_id]
+    }
 }
 
 impl Simulator for ServerCluster {
@@ -103,9 +108,9 @@ impl Simulator for ServerCluster {
         // Initialize raftstore channels.
         let mut event_loop = store::create_event_loop(&cfg.raft_store).unwrap();
         let store_sendch = SendCh::new(event_loop.channel(), "raftstore");
-        let raft_router = ServerRaftStoreRouter::new(store_sendch.clone());
-        let sim_router = SimulateTransport::new(raft_router);
         let (snap_status_sender, snap_status_receiver) = mpsc::channel();
+        let raft_router = ServerRaftStoreRouter::new(store_sendch.clone(), snap_status_sender);
+        let sim_router = SimulateTransport::new(raft_router);
 
         // Create storage.
         let mut store =
@@ -117,14 +122,16 @@ impl Simulator for ServerCluster {
         // Create pd client, snapshot manager, server.
         let (worker, resolver) = resolve::new_resolver(self.pd_client.clone()).unwrap();
         let snap_mgr = SnapManager::new(tmp_str, Some(store_sendch));
+        let pd_worker = FutureWorker::new("test-pd-worker");
         let mut server = Server::new(
             &cfg.server,
-            cfg.raft_store.region_split_size.0 as usize,
+            cfg.coprocessor.region_split_size.0 as usize,
             store.clone(),
             sim_router.clone(),
-            snap_status_sender,
             resolver,
             snap_mgr.clone(),
+            pd_worker.scheduler(),
+            Some(engines.clone()),
         ).unwrap();
         let addr = server.listening_addr();
         cfg.server.addr = format!("{}", addr);
@@ -138,12 +145,18 @@ impl Simulator for ServerCluster {
             &cfg.raft_store,
             self.pd_client.clone(),
         );
+
+        // Create coprocessor.
+        let coprocessor_host = CoprocessorHost::new(cfg.coprocessor, node.get_sendch());
+
         node.start(
             event_loop,
             engines,
             simulate_trans.clone(),
             snap_mgr.clone(),
             snap_status_receiver,
+            pd_worker,
+            coprocessor_host,
         ).unwrap();
         assert!(node_id == 0 || node_id == node.id());
         let node_id = node.id();
@@ -211,7 +224,7 @@ impl Simulator for ServerCluster {
 
     fn send_raft_msg(&mut self, raft_msg: raft_serverpb::RaftMessage) -> Result<()> {
         let store_id = raft_msg.get_to_peer().get_store_id();
-        let addr = self.addrs[&store_id];
+        let addr = self.get_addr(store_id);
         self.raft_client.send(store_id, addr, raft_msg).unwrap();
         self.raft_client.flush();
         Ok(())
